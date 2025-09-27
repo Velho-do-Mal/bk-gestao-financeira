@@ -1,0 +1,7 @@
+streamlit
+sqlalchemy
+pandas
+python-dateutil
+plotly
+reportlab
+
