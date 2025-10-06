@@ -1,7 +1,6 @@
-streamlit
-sqlalchemy
-pandas
-python-dateutil
-plotly
-reportlab
-
+streamlit==1.36.0
+plotly==5.24.1
+pandas==2.2.2
+SQLAlchemy==2.0.34
+python-dateutil==2.9.0.post0
+reportlab==4.2.2

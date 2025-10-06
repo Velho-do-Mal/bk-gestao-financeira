@@ -1,16 +1,18 @@
 # -*- coding: utf-8 -*-
-# BK Engenharia e Tecnologia — App de Gestão Financeira
-# Autor: Velho
-# Python: 3.13   |   UI: Streamlit   |   DB: SQLite/Cloud (SQLAlchemy)
-
+# BK Engenharia e Tecnologia — App de Gestão Financeira (arquivo único)
+# Python: 3.13 | Streamlit + SQLAlchemy | SQLite/Cloud
 from __future__ import annotations
+
+import plotly.express as px
 import os, io, re
 from datetime import date, datetime, timedelta
+import warnings
+warnings.filterwarnings("ignore", message="The keyword arguments have been deprecated")
 from dateutil.relativedelta import relativedelta
 from typing import Optional
 import pandas as pd
-import streamlit as st
 
+import streamlit as st
 from sqlalchemy import (
     create_engine, Column, Integer, String, Date, DateTime, Float, Boolean,
     ForeignKey, Text, func
@@ -20,17 +22,16 @@ from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 # ===========================
 # Configurações Gerais
 # ===========================
-
 APP_TITLE = "BK Gestão Financeira"
 APP_VERSION = "v1.8"
 
-# 1) Banco de dados: tenta pegar de variável de ambiente ou secrets do Streamlit
+# 1) DB_URL por env ou secrets (se usar secrets.toml, seção [general])
 DB_URL = (
     os.environ.get("DATABASE_URL")
-    or (st.secrets.get("database_url") if hasattr(st, "secrets") else None)
+    or (st.secrets.get("general", {}).get("database_url") if hasattr(st, "secrets") else None)
 )
 
-# 2) Se não existir (rodando local), cria SQLite em ./data/bk_finance.db
+# 2) Fallback local: ./data/bk_finance.db
 if not DB_URL:
     BASE_DIR = os.path.abspath(os.path.dirname(__file__))
     LOCAL_DB_DIR = os.path.join(BASE_DIR, "data")
@@ -42,15 +43,13 @@ ENGINE = create_engine(DB_URL, echo=False, future=True)
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, autocommit=False)
 Base = declarative_base()
 
-# 4) Pasta de anexos (também configurável por secrets)
+# 4) Pasta de anexos
 ATTACH_DIR = (
     os.environ.get("ATTACH_DIR")
-    or (st.secrets.get("attach_dir") if hasattr(st, "secrets") else None)
+    or (st.secrets.get("general", {}).get("attach_dir") if hasattr(st, "secrets") else None)
     or os.path.join(os.path.abspath(os.path.dirname(__file__)), "anexos")
 )
 os.makedirs(ATTACH_DIR, exist_ok=True)
-
-Base = declarative_base()
 
 # ===========================
 # Models
@@ -179,8 +178,7 @@ def ensure_seed_data():
             s.add(CentroCusto(nome="Geral", descricao="Padrão"))
         s.commit()
 
-# helper para commit + limpar cache + rerun (garante UI atualizada)
-import streamlit as st
+# helper commit + limpar cache + rerun
 def _done(session, msg: str):
     session.commit()
     st.cache_data.clear()
@@ -267,8 +265,6 @@ def make_recibo_pdf(transacao: Transacao, session) -> bytes:
 # ===========================
 # STREAMLIT
 # ===========================
-import plotly.express as px
-
 st.set_page_config(page_title=APP_TITLE, page_icon="💼", layout="wide", initial_sidebar_state="expanded")
 
 @st.cache_data(show_spinner=False)
@@ -280,33 +276,18 @@ def error(msg: str): st.toast(msg, icon="❌")
 
 ensure_seed_data()
 
-# ----- Sidebar -----
-def _db_pretty(u: str) -> str:
-    u = str(u)
-    return u.replace("sqlite:///", "") if u.lower().startswith("sqlite:///") else u
-
 with st.sidebar:
     st.title("💼 BK Gestão Financeira")
     st.caption(APP_VERSION)
-
-    page = st.radio(
-        "Navegação",
-        ["Home", "Cadastro", "Metas", "Movimentações", "Relatórios", "Dashboards"],
-        index=0,
-        key="nav_page",
-    )
-
+    page = st.radio("Navegação", ["Home","Cadastro","Metas","Movimentações","Relatórios","Dashboards"], index=0, key="nav_page")
     st.divider()
-    st.markdown("**Banco de Dados**")
-    st.code(_db_pretty(DB_URL), language="bash")
-
-    st.markdown("**Anexos**")
-    st.code(ATTACH_DIR, language="bash")
+    st.markdown("**Banco de Dados (URL/arquivo)**")
+    st.code(DB_URL, language="bash")
 
 st.markdown("""
 <style>
 .stButton>button {border-radius: 12px; padding: .6rem 1rem;}
-.stTextInput>div>div>input, .stNumberInput input, .stDateInput input {border-radius: 10px;}
+.stTextInput>div>div>input, .stNumberInput input, .stDateInput input, .stSelectbox div[data-baseweb="select"] {border-radius: 10px;}
 .metric-card {background:#f8f9fb; border-radius:16px; padding:18px; border:1px solid #edf0f4}
 </style>
 """, unsafe_allow_html=True)
@@ -408,7 +389,6 @@ elif page == "Cadastro":
                     else:
                         s.add(Cliente(nome=nome, documento=doc, email=email, telefone=tel))
                         _done(s, "Cliente cadastrado.")
-
         df_cli = df_query_cached("SELECT id, nome, documento, email, telefone, created_at FROM clientes ORDER BY id DESC")
         st.dataframe(df_cli, use_container_width=True)
         colE, colD = st.columns(2)
@@ -439,8 +419,7 @@ elif page == "Cadastro":
                     with get_session() as s:
                         obj = load_obj(s, Cliente, del_id)
                         if obj:
-                            s.delete(obj)
-                            _done(s, "Cliente excluído.")
+                            s.delete(obj); _done(s, "Cliente excluído.")
 
     # ---------- Fornecedores ----------
     with tabs[1]:
@@ -485,8 +464,7 @@ elif page == "Cadastro":
                     with get_session() as s:
                         obj = load_obj(s, Fornecedor, del_id)
                         if obj:
-                            s.delete(obj)
-                            _done(s, "Fornecedor excluído.")
+                            s.delete(obj); _done(s, "Fornecedor excluído.")
 
     # ---------- Bancos ----------
     with tabs[2]:
@@ -529,8 +507,7 @@ elif page == "Cadastro":
                     with get_session() as s:
                         obj = load_obj(s, Banco, del_id)
                         if obj:
-                            s.delete(obj)
-                            _done(s, "Banco excluído.")
+                            s.delete(obj); _done(s, "Banco excluído.")
 
     # ---------- Categorias ----------
     with tabs[3]:
@@ -538,12 +515,18 @@ elif page == "Cadastro":
         with st.form("form_cat_add", clear_on_submit=True):
             c1,c2 = st.columns(2)
             tipo = c1.selectbox("Tipo", ["Entrada","Saida"], key="cat_add_tipo")
-            nome = c2.text_input("Nome da categoria", key="cat_add_nome")
-            if st.form_submit_button("Adicionar Categoria") and nome:
+            # Nome com lista suspensa vinculada ao tipo (nomes existentes aparecem para facilitar padronização)
+            with get_session() as s:
+                nomes_exist = pd.read_sql("SELECT DISTINCT nome FROM categorias WHERE tipo=:t ORDER BY nome", s.bind, params={"t": tipo})
+            sugestoes = nomes_exist["nome"].tolist() if not nomes_exist.empty else []
+            nome = c2.selectbox("Nome da categoria", options=(["- digite novo -"] + sugestoes), key="cat_add_nome_sel")
+            if nome == "- digite novo -":
+                nome = c2.text_input("Novo nome", key="cat_add_nome_txt")
+            if st.form_submit_button("Adicionar Categoria") and (nome or "").strip():
                 with get_session() as s:
-                    s.add(Categoria(tipo=tipo, nome=nome))
+                    s.add(Categoria(tipo=tipo, nome=nome.strip()))
                     _done(s, "Categoria cadastrada.")
-        df_c = df_query_cached("SELECT id, tipo, nome FROM categorias ORDER BY id DESC")
+        df_c = df_query_cached("SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome")
         st.dataframe(df_c, use_container_width=True)
         colE, colD = st.columns(2)
         with colE:
@@ -558,9 +541,14 @@ elif page == "Cadastro":
                             with st.form("form_cat_edit"):
                                 c1,c2 = st.columns(2)
                                 tipo = c1.selectbox("Tipo", ["Entrada","Saida"], index=0 if obj.tipo=="Entrada" else 1, key="cat_edit_tipo")
-                                nome = c2.text_input("Nome", obj.nome, key="cat_edit_nome")
+                                nomes_exist = pd.read_sql("SELECT DISTINCT nome FROM categorias WHERE tipo=:t ORDER BY nome", s.bind, params={"t": tipo})
+                                sugestoes = nomes_exist["nome"].tolist() if not nomes_exist.empty else []
+                                cur = obj.nome if obj.nome not in sugestoes else None
+                                nome = c2.selectbox("Nome", options=(sugestoes + (["- digite novo -"] if cur or not sugestoes else [])), index=(sugestoes.index(obj.nome) if obj.nome in sugestoes else len(sugestoes)), key="cat_edit_nome_sel")
+                                if nome == "- digite novo -" or cur:
+                                    nome = c2.text_input("Novo nome", value=(cur or ""), key="cat_edit_nome_txt")
                                 if st.form_submit_button("Salvar alterações"):
-                                    obj.tipo, obj.nome = tipo, nome
+                                    obj.tipo, obj.nome = tipo, nome.strip()
                                     _done(s, "Categoria atualizada.")
         with colD:
             st.markdown("**Excluir Categoria**")
@@ -571,8 +559,7 @@ elif page == "Cadastro":
                     with get_session() as s:
                         obj = load_obj(s, Categoria, del_id)
                         if obj:
-                            s.delete(obj)
-                            _done(s, "Categoria excluída.")
+                            s.delete(obj); _done(s, "Categoria excluída.")
 
     # ---------- Subcategorias ----------
     with tabs[4]:
@@ -584,12 +571,20 @@ elif page == "Cadastro":
             if cats.empty:
                 st.info("Cadastre categorias primeiro."); st.form_submit_button("Adicionar", disabled=True)
             else:
-                cat_opt = c1.selectbox("Categoria", [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _,r in cats.iterrows()], key="sub_add_cat")
-                nome = c2.text_input("Nome da subcategoria", key="sub_add_nome")
-                if st.form_submit_button("Adicionar Subcategoria") and nome:
+                # seleção por tipo primeiro
+                tipo_sel = c1.selectbox("Tipo", ["Entrada", "Saida"], key="sub_add_tipo")
+                cats_tipo = cats[cats["tipo"] == tipo_sel]
+                cat_opt = c1.selectbox("Categoria", [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _,r in cats_tipo.iterrows()], key="sub_add_cat")
+                # Nome com sugestões (vinculado à categoria escolhida)
+                with get_session() as s:
+                    nomes_exist = pd.read_sql("SELECT DISTINCT nome FROM subcategorias WHERE categoria_id=:c ORDER BY nome", s.bind, params={"c": extract_id(cat_opt)})
+                sugestoes = nomes_exist["nome"].tolist() if not nomes_exist.empty else []
+                nome_sel = c2.selectbox("Nome da subcategoria", ["- digite novo -"] + sugestoes, key="sub_add_nome_sel")
+                nome = c2.text_input("Novo nome", key="sub_add_nome_txt") if nome_sel == "- digite novo -" else nome_sel
+                if st.form_submit_button("Adicionar Subcategoria") and (nome or "").strip():
                     cat_id = extract_id(cat_opt)
                     with get_session() as s:
-                        s.add(Subcategoria(categoria_id=cat_id, nome=nome))
+                        s.add(Subcategoria(categoria_id=cat_id, nome=nome.strip()))
                         _done(s, "Subcategoria cadastrada.")
         df_sc = df_query_cached("""
             SELECT s.id, c.tipo, c.nome AS categoria, s.nome AS subcategoria
@@ -610,15 +605,23 @@ elif page == "Cadastro":
                         if obj:
                             with st.form("form_sub_edit"):
                                 c1,c2 = st.columns(2)
+                                # tipo primeiro
+                                tipo_sel = c1.selectbox("Tipo", ["Entrada","Saida"], index=0 if s.get(Categoria, obj.categoria_id).tipo=="Entrada" else 1, key="sub_edit_tipo")
+                                cats_tipo = cats[cats["tipo"] == tipo_sel]
+                                # categoria da mesma linha como primeira opção
                                 cat_obj = s.get(Categoria, obj.categoria_id)
-                                cat_label = f"{cat_obj.tipo} - {cat_obj.nome} (# {obj.categoria_id})" if cat_obj else "-"
-                                all_opts = [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _,r in cats.iterrows()]
-                                options = [cat_label] + [o for o in all_opts if o != cat_label]
-                                escolha = c1.selectbox("Categoria", options, key="sub_edit_cat")
-                                nome = c2.text_input("Nome", obj.nome, key="sub_edit_nome")
+                                cat_label_cur = f"{cat_obj.tipo} - {cat_obj.nome} (# {cat_obj.id})" if cat_obj else "-"
+                                opts = [cat_label_cur] + [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _,r in cats_tipo.iterrows() if f"{r['tipo']} - {r['nome']} (# {r['id']})" != cat_label_cur]
+                                escolha = c1.selectbox("Categoria", opts, key="sub_edit_cat")
+                                # nome com sugestões vinculadas à categoria escolhida
+                                new_cat_id = extract_id(escolha) or obj.categoria_id
+                                nomes_exist = pd.read_sql("SELECT DISTINCT nome FROM subcategorias WHERE categoria_id=:c ORDER BY nome", s.bind, params={"c": new_cat_id})
+                                sugestoes = nomes_exist["nome"].tolist() if not nomes_exist.empty else []
+                                nome_sel = c2.selectbox("Nome", (sugestoes + ["- digite novo -"]), index=(sugestoes.index(obj.nome) if obj.nome in sugestoes else len(sugestoes)), key="sub_edit_nome_sel")
+                                nome = c2.text_input("Novo nome", value=(obj.nome if nome_sel=="- digite novo -" else ""), key="sub_edit_nome_txt") if nome_sel=="- digite novo -" else nome_sel
                                 if st.form_submit_button("Salvar alterações"):
-                                    obj.categoria_id = extract_id(escolha) or obj.categoria_id
-                                    obj.nome = nome
+                                    obj.categoria_id = new_cat_id
+                                    obj.nome = nome.strip()
                                     _done(s, "Subcategoria atualizada.")
         with colD:
             st.markdown("**Excluir Subcategoria**")
@@ -629,8 +632,7 @@ elif page == "Cadastro":
                     with get_session() as s:
                         obj = load_obj(s, Subcategoria, del_id)
                         if obj:
-                            s.delete(obj)
-                            _done(s, "Subcategoria excluída.")
+                            s.delete(obj); _done(s, "Subcategoria excluída.")
 
     # ---------- Centros de Custo ----------
     with tabs[5]:
@@ -645,7 +647,7 @@ elif page == "Cadastro":
                     else:
                         s.add(CentroCusto(nome=nome, descricao=desc))
                         _done(s, "Centro de custo cadastrado.")
-        df_cc = df_query_cached("SELECT id, nome, descricao FROM centros_custo ORDER BY id DESC")
+        df_cc = df_query_cached("SELECT id, nome, descricao FROM centros_custo ORDER BY nome")
         st.dataframe(df_cc, use_container_width=True)
         colE, colD = st.columns(2)
         with colE:
@@ -673,8 +675,7 @@ elif page == "Cadastro":
                     with get_session() as s:
                         obj = load_obj(s, CentroCusto, del_id)
                         if obj:
-                            s.delete(obj)
-                            _done(s, "Centro de custo excluído.")
+                            s.delete(obj); _done(s, "Centro de custo excluído.")
 
 # ===========================
 # Metas
@@ -760,8 +761,7 @@ elif page == "Metas":
                 with get_session() as s:
                     obj = load_obj(s, Meta, del_id)
                     if obj:
-                        s.delete(obj)
-                        _done(s, "Meta excluída.")
+                        s.delete(obj); _done(s, "Meta excluída.")
 
 # ===========================
 # Movimentações
@@ -772,105 +772,137 @@ elif page == "Movimentações":
 
     # --------- Lançamentos (ADD) ---------
     with tabs[0]:
-        with get_session() as s:
-            cats = pd.read_sql("SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome", s.bind)
-            subs = pd.read_sql("SELECT id, categoria_id, nome FROM subcategorias", s.bind)
-            ccs  = pd.read_sql("SELECT id, nome FROM centros_custo", s.bind)
-            clientes = pd.read_sql("SELECT id, nome FROM clientes ORDER BY nome", s.bind)
-            fornecedores = pd.read_sql("SELECT id, nome FROM fornecedores ORDER BY nome", s.bind)
-            bancos = pd.read_sql("SELECT id, nome FROM bancos ORDER BY nome", s.bind)
 
+                # -------- DADOS AUXILIARES --------
+        with get_session() as s:
+            df_cat_all = pd.read_sql("SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome", s.bind)
+            df_sub_all = pd.read_sql("SELECT id, categoria_id, nome FROM subcategorias ORDER BY nome", s.bind)
+            df_cc_all  = pd.read_sql("SELECT id, nome FROM centros_custo ORDER BY nome", s.bind)
+            df_cli_all = pd.read_sql("SELECT id, nome FROM clientes ORDER BY nome", s.bind)
+            df_forn_all= pd.read_sql("SELECT id, nome FROM fornecedores ORDER BY nome", s.bind)
+            df_bco_all = pd.read_sql("SELECT id, nome FROM bancos ORDER BY nome", s.bind)
+
+        # =========================
+        # Incluir Lançamento
+        # =========================
         st.subheader("Incluir Lançamento")
         with st.form("form_tx_add", clear_on_submit=True):
-            c1,c2,c3,c4 = st.columns(4)
-            tipo = c1.selectbox("Tipo", ["Entrada","Saida"], key="tx_add_tipo")
-            cat_rows = [r for _, r in cats.iterrows() if r["tipo"] == tipo]
-            cat_opts = [f"{r['tipo']} - {r['nome']} (# {r['id']})" for r in cat_rows]
-            cat_opt = c2.selectbox("Categoria", cat_opts, placeholder="Selecione", index=0 if cat_opts else None, key="tx_add_cat")
-            if not cat_opts:
-                st.warning("Cadastre ao menos uma categoria desse tipo.")
-                st.form_submit_button("Lançar", disabled=True)
-            else:
-                cat_id = extract_id(cat_opt)
-                subs_cat = subs[subs["categoria_id"]==cat_id]
-                sub_opt = c3.selectbox("Subcategoria", ["-"] + [f"{r['nome']} (# {r['id']})" for _,r in subs_cat.iterrows()], key="tx_add_sub")
-                valor = c4.number_input("Valor (R$)", min_value=0.0, step=100.0, format="%.2f", key="tx_add_valor")
+            c1, c2, c3, c4 = st.columns(4)
 
-                d1,d2,d3,d4 = st.columns(4)
-                data_prevista = d1.date_input("Data Prevista", value=date.today(), key="tx_add_data_prev")
-                foi_pago = d2.checkbox("Pago?", key="tx_add_pago")
-                data_real = d3.date_input("Data Real", value=date.today(), key="tx_add_data_real") if foi_pago else None
-                banco_opt = d4.selectbox("Banco", ["-"] + [f"{r['nome']} (# {r['id']})" for _,r in bancos.iterrows()], key="tx_add_banco")
+            tipo_add = c1.selectbox("Tipo", ["Entrada", "Saida"], key="tx_add_tipo")
+            # categorias só do tipo escolhido
+            cat_rows = df_cat_all[df_cat_all["tipo"] == tipo_add]
+            cat_opts = [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _, r in cat_rows.iterrows()]
+            cat_add  = c2.selectbox("Categoria", cat_opts, placeholder="Selecione", key="tx_add_cat")
 
-                e1,e2,e3 = st.columns(3)
-                cc_opt  = e1.selectbox("Centro de Custo", ["-"] + [f"{r['nome']} (# {r['id']})" for _,r in ccs.iterrows()], key="tx_add_cc")
-                cli_opt = e2.selectbox("Cliente (Entrada)", ["-"] + [f"{r['nome']} (# {r['id']})" for _,r in clientes.iterrows()], key="tx_add_cli")
-                forn_opt= e3.selectbox("Fornecedor (Saída)", ["-"] + [f"{r['nome']} (# {r['id']})" for _,r in fornecedores.iterrows()], key="tx_add_forn")
+            # subcategorias daquela categoria
+            cat_id_add = extract_id(cat_add) if cat_add else None
+            sub_rows = df_sub_all[df_sub_all["categoria_id"] == (cat_id_add or -1)]
+            sub_opts = ["-"] + [f"{r['nome']} (# {r['id']})" for _, r in sub_rows.iterrows()]
+            sub_add  = c3.selectbox("Subcategoria", sub_opts, key="tx_add_sub")
 
-                desc = st.text_area("Descrição", key="tx_add_desc")
+            valor_add = c4.number_input("Valor (R$)", min_value=0.0, step=100.0, format="%.2f", key="tx_add_valor")
 
-                st.markdown("**Recorrência**")
-                r1,r2,r3 = st.columns(3)
-                recorrencia = r1.selectbox("Tipo", ["Unica","Mensal","Anual","Parcelado"], key="tx_add_rec_tipo")
-                parcelas_total = None
-                if recorrencia == "Parcelado":
-                    parcelas_total = r2.number_input("Nº de parcelas", min_value=1, max_value=120, value=1, key="tx_add_rec_parc")
-                    periodicidade = r3.selectbox("Periodicidade", ["Mensal","Anual"], key="tx_add_rec_per")
-                else:
-                    periodicidade = "Mensal"
+            d1, d2, d3, d4 = st.columns(4)
+            data_prev_add = d1.date_input("Data Prevista", value=date.today(), key="tx_add_data_prev")
+            pago_add      = d2.checkbox("Pago?", key="tx_add_pago")
+            data_real_add = d3.date_input("Data Real", value=date.today(), key="tx_add_data_real") if pago_add else None
+            bco_opts = ["-"] + [f"{r['nome']} (# {r['id']})" for _, r in df_bco_all.iterrows()]
+            bco_add  = d4.selectbox("Banco", bco_opts, key="tx_add_banco")
 
-                if st.form_submit_button("Lançar"):
-                    with get_session() as s:
-                        def add_tx(idx:int, dt:date):
-                            t = Transacao(
-                                tipo=tipo, categoria_id=cat_id,
-                                subcategoria_id=extract_id(sub_opt) if sub_opt!="-" else None,
-                                valor=float(valor), data_prevista=dt,
-                                foi_pago=bool(foi_pago),
-                                data_real=(data_real if foi_pago else None),
-                                centro_custo_id=extract_id(cc_opt) if cc_opt!="-" else None,
-                                cliente_id=extract_id(cli_opt) if (tipo=="Entrada" and cli_opt!="-") else None,
-                                fornecedor_id=extract_id(forn_opt) if (tipo=="Saida" and forn_opt!="-") else None,
-                                banco_id=extract_id(banco_opt) if banco_opt!="-" else None,
-                                descricao=desc, recorrencia=recorrencia,
-                                parcelas_total=int(parcelas_total) if parcelas_total else None,
-                                parcela_index=idx if parcelas_total else None,
-                            )
-                            s.add(t); s.flush()
-                        if recorrencia == "Unica":
-                            add_tx(None, data_prevista)
-                        elif recorrencia in ("Mensal","Anual"):
-                            steps = 12 if recorrencia=="Mensal" else 5
-                            for i in range(steps):
-                                dt = data_prevista + (relativedelta(months=i) if recorrencia=="Mensal" else relativedelta(years=i))
-                                add_tx(None, dt)
-                        elif recorrencia == "Parcelado":
-                            for i in range(1, int(parcelas_total)+1):
-                                dt = data_prevista + (relativedelta(months=i-1) if periodicidade=="Mensal" else relativedelta(years=i-1))
-                                add_tx(i, dt)
-                        _done(s, "Movimentação(ões) lançada(s).")
+            e1, e2, e3 = st.columns(3)
+            cc_opts   = ["-"] + [f"{r['nome']} (# {r['id']})" for _, r in df_cc_all.iterrows()]
+            cc_add    = e1.selectbox("Centro de Custo", cc_opts, key="tx_add_cc")
+            cli_opts  = ["-"] + [f"{r['nome']} (# {r['id']})" for _, r in df_cli_all.iterrows()]
+            forn_opts = ["-"] + [f"{r['nome']} (# {r['id']})" for _, r in df_forn_all.iterrows()]
+            cli_add   = e2.selectbox("Cliente (Entrada)", cli_opts, key="tx_add_cli")
+            forn_add  = e3.selectbox("Fornecedor (Saída)", forn_opts, key="tx_add_forn")
 
+            desc_add = st.text_area("Descrição", key="tx_add_desc")
+
+            st.markdown("**Recorrência**")
+            r1, r2, r3 = st.columns(3)
+            recorr_add = r1.selectbox("Tipo", ["Unica", "Mensal", "Anual", "Parcelado"], key="tx_add_rec")
+            parcelas_total_add = None
+            periodicidade_add = "Mensal"
+            if recorr_add == "Parcelado":
+                parcelas_total_add = r2.number_input("Nº de parcelas", min_value=1, max_value=120, value=2, key="tx_add_parc_n")
+                periodicidade_add = r3.selectbox("Periodicidade", ["Mensal", "Anual"], key="tx_add_parc_per")
+
+            # --- SUBMIT ---
+            if st.form_submit_button("Lançar"):
+                if not cat_id_add:
+                    error("Selecione a categoria."); st.stop()
+
+                with get_session() as s:
+                    def add_tx(idx: Optional[int], dt: date):
+                        t = Transacao(
+                            tipo=tipo_add,
+                            categoria_id=cat_id_add,
+                            subcategoria_id=extract_id(sub_add) if sub_add and sub_add != "-" else None,
+                            valor=float(valor_add or 0),
+                            data_prevista=dt,
+                            foi_pago=bool(pago_add),
+                            data_real=(data_real_add if pago_add else None),
+                            centro_custo_id=extract_id(cc_add) if cc_add and cc_add != "-" else None,
+                            cliente_id=extract_id(cli_add) if (tipo_add == "Entrada" and cli_add != "-") else None,
+                            fornecedor_id=extract_id(forn_add) if (tipo_add == "Saida" and forn_add != "-") else None,
+                            banco_id=extract_id(bco_add) if bco_add and bco_add != "-" else None,
+                            descricao=desc_add or "",
+                            recorrencia=recorr_add,
+                            parcelas_total=int(parcelas_total_add) if parcelas_total_add else None,
+                            parcela_index=idx if parcelas_total_add else None,
+                        )
+                        s.add(t)
+
+                    if recorr_add == "Unica":
+                        add_tx(None, data_prev_add)
+
+                    elif recorr_add in ("Mensal", "Anual"):
+                        # 12 meses / 5 anos como exemplo de planejamento
+                        steps = 12 if recorr_add == "Mensal" else 5
+                        for i in range(steps):
+                            dt = data_prev_add + (relativedelta(months=i) if recorr_add == "Mensal" else relativedelta(years=i))
+                            add_tx(None, dt)
+
+                    elif recorr_add == "Parcelado":
+                        total = int(parcelas_total_add or 1)
+                        for i in range(1, total + 1):
+                            dt = data_prev_add + (relativedelta(months=i - 1) if periodicidade_add == "Mensal" else relativedelta(years=i - 1))
+                            add_tx(i, dt)
+
+                    _done(s, "Movimentação(ões) lançada(s).")
+
+        # =========================
+        # Lista + Editar / Excluir
+        # =========================
         st.subheader("Lançamentos — Lista")
         with get_session() as s:
-            df_tx = pd.read_sql("""
-                SELECT t.id, t.tipo, c.nome as categoria, s2.nome as subcategoria, t.valor,
+            df_tx = pd.read_sql(
+                """
+                SELECT t.id, t.tipo, c.nome AS categoria, s2.nome AS subcategoria, t.valor,
                        t.data_prevista, t.foi_pago, t.data_real,
-                       cc.nome as centro_custo, cli.nome as cliente, f.nome as fornecedor, b.nome as banco, t.descricao
+                       cc.nome AS centro_custo, cli.nome AS cliente, f.nome AS fornecedor, b.nome AS banco, t.descricao
                 FROM transacoes t
-                JOIN categorias c ON c.id=t.categoria_id
-                LEFT JOIN subcategorias s2 ON s2.id=t.subcategoria_id
-                LEFT JOIN centros_custo cc ON cc.id=t.centro_custo_id
-                LEFT JOIN clientes cli ON cli.id=t.cliente_id
-                LEFT JOIN fornecedores f ON f.id=t.fornecedor_id
-                LEFT JOIN bancos b ON b.id=t.banco_id
+                JOIN categorias c ON c.id = t.categoria_id
+                LEFT JOIN subcategorias s2 ON s2.id = t.subcategoria_id
+                LEFT JOIN centros_custo cc ON cc.id = t.centro_custo_id
+                LEFT JOIN clientes cli ON cli.id = t.cliente_id
+                LEFT JOIN fornecedores f ON f.id = t.fornecedor_id
+                LEFT JOIN bancos b ON b.id = t.banco_id
                 ORDER BY t.data_prevista DESC, t.id DESC
-            """, s.bind)
+                """,
+                s.bind,
+            )
         st.dataframe(df_tx, use_container_width=True)
 
         colE, colD = st.columns(2)
+
+        # ---------- Editar ----------
         with colE:
             st.markdown("**Editar Lançamento**")
-            if df_tx.empty: st.info("Sem lançamentos.")
+            if df_tx.empty:
+                st.info("Sem lançamentos.")
             else:
                 edit_id = input_id_to_edit_delete(df_tx, "ID", key="tx_edit_id")
                 if edit_id:
@@ -878,75 +910,105 @@ elif page == "Movimentações":
                         t = load_obj(s, Transacao, edit_id)
                         if t:
                             with st.form("form_tx_edit"):
-                                c1,c2,c3,c4 = st.columns(4)
-                                tipo = c1.selectbox("Tipo", ["Entrada","Saida"], index=0 if t.tipo=="Entrada" else 1, key="tx_edit_tipo")
-                                cats = pd.read_sql("SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome", s.bind)
-                                cat_obj = s.get(Categoria, t.categoria_id)
-                                cat_label = f"{cat_obj.tipo} - {cat_obj.nome} (# {t.categoria_id})" if cat_obj else "-"
-                                all_opts = [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _,r in cats.iterrows()]
-                                cat_opt = c2.selectbox("Categoria", [cat_label] + [o for o in all_opts if o != cat_label], key="tx_edit_cat")
-                                subs = pd.read_sql(
-                                    "SELECT id, nome FROM subcategorias WHERE categoria_id=:c",
-                                    s.bind, params={"c": (extract_id(cat_opt) or t.categoria_id)}
+                                c1, c2, c3, c4 = st.columns(4)
+                                tipo_ed = c1.selectbox("Tipo", ["Entrada", "Saida"], index=0 if t.tipo == "Entrada" else 1, key="tx_edit_tipo")
+
+                                # categorias do tipo escolhido
+                                df_cat_typ = pd.read_sql(
+                                    "SELECT id, tipo, nome FROM categorias WHERE tipo=:tp ORDER BY nome",
+                                    s.bind,
+                                    params={"tp": tipo_ed},
                                 )
-                                sub_label = "-"
+                                # label atual
+                                cat_cur = s.get(Categoria, t.categoria_id)
+                                cat_label_cur = f"{cat_cur.tipo} - {cat_cur.nome} (# {cat_cur.id})" if cat_cur else "-"
+                                cat_opts_ed = [cat_label_cur] + [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _, r in df_cat_typ.iterrows() if f"{r['tipo']} - {r['nome']} (# {r['id']})" != cat_label_cur]
+                                cat_ed = c2.selectbox("Categoria", cat_opts_ed, key="tx_edit_cat")
+
+                                # subcategorias conforme categoria escolhida (ou atual)
+                                cat_id_sel = extract_id(cat_ed) or t.categoria_id
+                                df_sub_typ = pd.read_sql(
+                                    "SELECT id, nome FROM subcategorias WHERE categoria_id=:c ORDER BY nome",
+                                    s.bind,
+                                    params={"c": cat_id_sel},
+                                )
+                                sub_label_cur = "-"
                                 if t.subcategoria_id:
                                     sc = s.get(Subcategoria, t.subcategoria_id)
-                                    if sc: sub_label = f"{sc.nome} (# {sc.id})"
-                                sub_opt = c3.selectbox("Subcategoria", ["-"] + ([sub_label] if sub_label != "-" else []) + [f"{r['nome']} (# {r['id']})" for _,r in subs.iterrows()], key="tx_edit_sub")
-                                valor = c4.number_input("Valor (R$)", min_value=0.0, step=100.0, format="%.2f", value=float(t.valor or 0), key="tx_edit_valor")
+                                    if sc:
+                                        sub_label_cur = f"{sc.nome} (# {sc.id})"
+                                sub_opts_ed = ["-"] + ([sub_label_cur] if sub_label_cur != "-" else []) + [f"{r['nome']} (# {r['id']})" for _, r in df_sub_typ.iterrows() if f"{r['nome']} (# {r['id']})" != sub_label_cur]
+                                sub_ed = c3.selectbox("Subcategoria", sub_opts_ed, key="tx_edit_sub")
 
-                                d1,d2,d3,d4 = st.columns(4)
-                                data_prevista = d1.date_input("Data Prevista", value=t.data_prevista, key="tx_edit_data_prev")
-                                foi_pago = d2.checkbox("Pago?", value=bool(t.foi_pago), key="tx_edit_pago")
-                                data_real = d3.date_input("Data Real", value=t.data_real or date.today(), key="tx_edit_data_real") if foi_pago else None
-                                bancos = pd.read_sql("SELECT id, nome FROM bancos ORDER BY nome", s.bind)
-                                banco_label = "-"
+                                valor_ed = c4.number_input("Valor (R$)", min_value=0.0, step=100.0, format="%.2f", value=float(t.valor or 0), key="tx_edit_valor")
+
+                                d1, d2, d3, d4 = st.columns(4)
+                                data_prev_ed = d1.date_input("Data Prevista", value=t.data_prevista, key="tx_edit_data_prev")
+                                pago_ed      = d2.checkbox("Pago?", value=bool(t.foi_pago), key="tx_edit_pago")
+                                data_real_ed = d3.date_input("Data Real", value=t.data_real or date.today(), key="tx_edit_data_real") if pago_ed else None
+
+                                # banco
+                                df_bco = pd.read_sql("SELECT id, nome FROM bancos ORDER BY nome", s.bind)
+                                bco_label_cur = "-"
                                 if t.banco_id:
-                                    b = s.get(Banco, t.banco_id)
-                                    if b: banco_label = f"{b.nome} (# {t.banco_id})"
-                                banco_opt = d4.selectbox("Banco", [banco_label] + [f"{r['nome']} (# {r['id']})" for _,r in bancos.iterrows()], key="tx_edit_banco")
+                                    bco_cur = s.get(Banco, t.banco_id)
+                                    if bco_cur:
+                                        bco_label_cur = f"{bco_cur.nome} (# {bco_cur.id})"
+                                bco_opts_ed = [bco_label_cur] + [f"{r['nome']} (# {r['id']})" for _, r in df_bco.iterrows() if f"{r['nome']} (# {r['id']})" != bco_label_cur]
+                                bco_ed = d4.selectbox("Banco", bco_opts_ed, key="tx_edit_banco")
 
-                                e1,e2,e3 = st.columns(3)
-                                ccs  = pd.read_sql("SELECT id, nome FROM centros_custo ORDER BY nome", s.bind)
-                                cc_label = "-"
+                                e1, e2, e3 = st.columns(3)
+                                # CC
+                                df_cc = pd.read_sql("SELECT id, nome FROM centros_custo ORDER BY nome", s.bind)
+                                cc_label_cur = "-"
                                 if t.centro_custo_id:
-                                    cc = s.get(CentroCusto, t.centro_custo_id)
-                                    if cc: cc_label = f"{cc.nome} (# {t.centro_custo_id})"
-                                cc_opt  = e1.selectbox("Centro de Custo", [cc_label] + [f"{r['nome']} (# {r['id']})" for _,r in ccs.iterrows()], key="tx_edit_cc")
-                                clientes = pd.read_sql("SELECT id, nome FROM clientes ORDER BY nome", s.bind)
-                                cli_label = "-"
-                                if t.cliente_id:
-                                    cli = s.get(Cliente, t.cliente_id)
-                                    if cli: cli_label = f"{cli.nome} (# {t.cliente_id})"
-                                cli_opt = e2.selectbox("Cliente (Entrada)", [cli_label] + [f"{r['nome']} (# {r['id']})" for _,r in clientes.iterrows()], key="tx_edit_cli")
-                                fornecedores = pd.read_sql("SELECT id, nome FROM fornecedores ORDER BY nome", s.bind)
-                                forn_label = "-"
-                                if t.fornecedor_id:
-                                    forn = s.get(Fornecedor, t.fornecedor_id)
-                                    if forn: forn_label = f"{forn.nome} (# {t.fornecedor_id})"
-                                forn_opt= e3.selectbox("Fornecedor (Saída)", [forn_label] + [f"{r['nome']} (# {r['id']})" for _,r in fornecedores.iterrows()], key="tx_edit_forn")
+                                    cc_cur = s.get(CentroCusto, t.centro_custo_id)
+                                    if cc_cur:
+                                        cc_label_cur = f"{cc_cur.nome} (# {cc_cur.id})"
+                                cc_opts_ed = [cc_label_cur] + [f"{r['nome']} (# {r['id']})" for _, r in df_cc.iterrows() if f"{r['nome']} (# {r['id']})" != cc_label_cur]
+                                cc_ed = e1.selectbox("Centro de Custo", cc_opts_ed, key="tx_edit_cc")
 
-                                desc = st.text_area("Descrição", t.descricao or "", key="tx_edit_desc")
+                                # cliente / fornecedor
+                                df_cli = pd.read_sql("SELECT id, nome FROM clientes ORDER BY nome", s.bind)
+                                cli_label_cur = "-"
+                                if t.cliente_id:
+                                    cli_cur = s.get(Cliente, t.cliente_id)
+                                    if cli_cur:
+                                        cli_label_cur = f"{cli_cur.nome} (# {cli_cur.id})"
+                                cli_opts_ed = [cli_label_cur] + [f"{r['nome']} (# {r['id']})" for _, r in df_cli.iterrows() if f"{r['nome']} (# {r['id']})" != cli_label_cur]
+                                cli_ed = e2.selectbox("Cliente (Entrada)", cli_opts_ed, key="tx_edit_cli")
+
+                                df_forn = pd.read_sql("SELECT id, nome FROM fornecedores ORDER BY nome", s.bind)
+                                forn_label_cur = "-"
+                                if t.fornecedor_id:
+                                    f_cur = s.get(Fornecedor, t.fornecedor_id)
+                                    if f_cur:
+                                        forn_label_cur = f"{f_cur.nome} (# {f_cur.id})"
+                                forn_opts_ed = [forn_label_cur] + [f"{r['nome']} (# {r['id']})" for _, r in df_forn.iterrows() if f"{r['nome']} (# {r['id']})" != forn_label_cur]
+                                forn_ed = e3.selectbox("Fornecedor (Saída)", forn_opts_ed, key="tx_edit_forn")
+
+                                desc_ed = st.text_area("Descrição", t.descricao or "", key="tx_edit_desc")
 
                                 if st.form_submit_button("Salvar alterações"):
-                                    t.tipo = tipo
-                                    t.categoria_id = extract_id(cat_opt) or t.categoria_id
-                                    t.subcategoria_id = extract_id(sub_opt) if sub_opt and sub_opt != "-" else None
-                                    t.valor = float(valor)
-                                    t.data_prevista = data_prevista
-                                    t.foi_pago = bool(foi_pago)
-                                    t.data_real = data_real if foi_pago else None
-                                    t.banco_id = extract_id(banco_opt) if banco_opt and banco_opt != "-" else None
-                                    t.centro_custo_id = extract_id(cc_opt) if cc_opt and cc_opt != "-" else None
-                                    t.cliente_id = extract_id(cli_opt) if cli_opt and cli_opt != "-" else None
-                                    t.fornecedor_id = extract_id(forn_opt) if forn_opt and forn_opt != "-" else None
-                                    t.descricao = desc
+                                    t.tipo = tipo_ed
+                                    t.categoria_id = extract_id(cat_ed) or t.categoria_id
+                                    t.subcategoria_id = extract_id(sub_ed) if sub_ed and sub_ed != "-" else None
+                                    t.valor = float(valor_ed)
+                                    t.data_prevista = data_prev_ed
+                                    t.foi_pago = bool(pago_ed)
+                                    t.data_real = (data_real_ed if pago_ed else None)
+                                    t.banco_id = extract_id(bco_ed) if bco_ed and bco_ed != "-" else None
+                                    t.centro_custo_id = extract_id(cc_ed) if cc_ed and cc_ed != "-" else None
+                                    t.cliente_id = extract_id(cli_ed) if cli_ed and cli_ed != "-" else None
+                                    t.fornecedor_id = extract_id(forn_ed) if forn_ed and forn_ed != "-" else None
+                                    t.descricao = desc_ed
                                     _done(s, "Lançamento atualizado.")
 
+        # ---------- Excluir ----------
         with colD:
             st.markdown("**Excluir Lançamento**")
-            if df_tx.empty: st.info("Sem lançamentos.")
+            if df_tx.empty:
+                st.info("Sem lançamentos.")
             else:
                 del_id = input_id_to_edit_delete(df_tx, "ID", key="tx_del_id")
                 if del_id and st.button("Excluir lançamento", key="tx_del_btn"):
@@ -956,27 +1018,37 @@ elif page == "Movimentações":
                             s.delete(t)
                             _done(s, "Lançamento excluído.")
 
-        # ---- Anexos / Recibo ----
+        # =========================
+        # Anexos / Recibo
+        # =========================
         st.subheader("Anexos e Recibos")
-        colA, colB = st.columns([2,1])
+        colA, colB = st.columns([2, 1])
         with colA:
             trans_id = st.number_input("ID da transação", min_value=1, step=1, value=1, key="anx_tx_id")
-            up = st.file_uploader("Anexar arquivo", type=["pdf","png","jpg","jpeg","xlsx","csv","docx","zip"], accept_multiple_files=True, key="anx_uploader")
+            up = st.file_uploader(
+                "Anexar arquivo",
+                type=["pdf", "png", "jpg", "jpeg", "xlsx", "csv", "docx", "zip"],
+                accept_multiple_files=True,
+                key="anx_uploader",
+            )
             if st.button("Salvar Anexo(s)", key="anx_save"):
                 with get_session() as s:
-                    if not s.get(Transacao, int(trans_id)): error("Transação não encontrada.")
+                    if not s.get(Transacao, int(trans_id)):
+                        error("Transação não encontrada.")
                     else:
                         for f in up or []:
                             fname = f"T{int(trans_id)}_{int(datetime.utcnow().timestamp())}_{f.name}"
                             fpath = os.path.join(ATTACH_DIR, fname)
-                            with open(fpath, "wb") as fh: fh.write(f.getbuffer())
+                            with open(fpath, "wb") as fh:
+                                fh.write(f.getbuffer())
                             s.add(Anexo(transacao_id=int(trans_id), filename=fname, path=fpath))
                         _done(s, "Anexos salvos.")
         with colB:
             if st.button("Gerar Recibo (PDF)", key="recibo_btn"):
                 with get_session() as s:
                     t = s.get(Transacao, int(trans_id))
-                    if not t: error("Transação não encontrada.")
+                    if not t:
+                        error("Transação não encontrada.")
                     else:
                         pdf_bytes = make_recibo_pdf(t, s)
                         fname = f"RECIBO_T{t.id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
@@ -984,37 +1056,23 @@ elif page == "Movimentações":
                         with open(fpath, "wb") as f:
                             f.write(pdf_bytes)
                         success(f"Recibo salvo em {fpath}")
-                        st.download_button(
-                            "Baixar Recibo",
-                            data=pdf_bytes,
-                            file_name=fname,
-                            mime="application/pdf",
-                            key="recibo_download",
-                        )
+                        st.download_button("Baixar Recibo", data=pdf_bytes, file_name=fname, mime="application/pdf", key="recibo_download")
 
     # --------- Transferências ---------
     with tabs[1]:
         st.caption("Transferências movem saldos entre bancos (não afetam resultado).")
         with get_session() as s:
-            bancos = pd.read_sql("SELECT id, nome FROM bancos ORDER BY nome", s.bind)
+            df_bancos = pd.read_sql("SELECT id, nome FROM bancos ORDER BY nome", s.bind)
 
         st.subheader("Incluir Transferência")
         with st.form("form_trf_add", clear_on_submit=True):
-            c1,c2,c3,c4 = st.columns(4)
-            b_origem = c1.selectbox(
-                "Banco origem",
-                [f"{r['nome']} (# {r['id']})" for _,r in bancos.iterrows()] if not bancos.empty else [],
-                key="trf_add_origem",
-            )
-            b_dest   = c2.selectbox(
-                "Banco destino",
-                [f"{r['nome']} (# {r['id']})" for _,r in bancos.iterrows()] if not bancos.empty else [],
-                key="trf_add_dest",
-            )
+            c1, c2, c3, c4 = st.columns(4)
+            b_origem = c1.selectbox("Banco origem", [f"{r['nome']} (# {r['id']})" for _, r in df_bancos.iterrows()] if not df_bancos.empty else [], key="trf_add_origem")
+            b_dest   = c2.selectbox("Banco destino", [f"{r['nome']} (# {r['id']})" for _, r in df_bancos.iterrows()] if not df_bancos.empty else [], key="trf_add_dest")
             valor    = c3.number_input("Valor (R$)", min_value=0.0, step=100.0, format="%.2f", key="trf_add_valor")
             data_prev= c4.date_input("Data prevista", value=date.today(), key="trf_add_data")
             desc     = st.text_input("Descrição (opcional)", key="trf_add_desc")
-            if st.form_submit_button("Cadastrar Transferência") and b_origem and b_dest and valor>0:
+            if st.form_submit_button("Cadastrar Transferência", key="trf_add_submit") and b_origem and b_dest and valor > 0:
                 o_id = extract_id(b_origem); d_id = extract_id(b_dest)
                 if not o_id or not d_id:
                     error("Selecione origem e destino válidos.")
@@ -1022,25 +1080,22 @@ elif page == "Movimentações":
                     error("Origem e destino não podem ser iguais.")
                 else:
                     with get_session() as s:
-                        s.add(Transferencia(
-                            banco_origem_id=o_id,
-                            banco_destino_id=d_id,
-                            valor=float(valor),
-                            data_prevista=data_prev,
-                            descricao=desc
-                        ))
+                        s.add(Transferencia(banco_origem_id=o_id, banco_destino_id=d_id, valor=float(valor), data_prevista=data_prev, descricao=desc))
                         _done(s, "Transferência cadastrada.")
 
         st.subheader("Lista de Transferências")
         with get_session() as s:
-            dft = pd.read_sql("""
+            dft = pd.read_sql(
+                """
                 SELECT t.id, b1.nome AS origem, b2.nome AS destino, t.valor, t.data_prevista,
                        t.foi_executada, t.data_real, t.descricao
                 FROM transferencias t
-                JOIN bancos b1 ON b1.id=t.banco_origem_id
-                JOIN bancos b2 ON b2.id=t.banco_destino_id
+                JOIN bancos b1 ON b1.id = t.banco_origem_id
+                JOIN bancos b2 ON b2.id = t.banco_destino_id
                 ORDER BY t.data_prevista DESC, t.id DESC
-            """, s.bind)
+                """,
+                s.bind,
+            )
         st.dataframe(dft, use_container_width=True)
 
         exec_id = input_id_to_edit_delete(dft, "ID para executar/desfazer", key="trf_exec_id") if not dft.empty else None
@@ -1076,36 +1131,24 @@ elif page == "Movimentações":
                 if edit_id:
                     with get_session() as s:
                         tr = load_obj(s, Transferencia, edit_id)
-                        bancos = pd.read_sql("SELECT id, nome FROM bancos ORDER BY nome", s.bind)
+                        df_bancos = pd.read_sql("SELECT id, nome FROM bancos ORDER BY nome", s.bind)
                         if tr:
                             with st.form("form_trf_edit"):
-                                c1,c2,c3,c4 = st.columns(4)
+                                c1, c2, c3, c4 = st.columns(4)
                                 borig_cur = s.get(Banco, tr.banco_origem_id)
                                 bdest_cur = s.get(Banco, tr.banco_destino_id)
-                                borig = c1.selectbox(
-                                    "Origem",
-                                    ([f"{borig_cur.nome} (# {tr.banco_origem_id})"] if borig_cur else []) +
-                                    [f"{r['nome']} (# {r['id']})" for _,r in bancos.iterrows()],
-                                    key="trf_edit_origem",
-                                )
-                                bdest = c2.selectbox(
-                                    "Destino",
-                                    ([f"{bdest_cur.nome} (# {tr.banco_destino_id})"] if bdest_cur else []) +
-                                    [f"{r['nome']} (# {r['id']})" for _,r in bancos.iterrows()],
-                                    key="trf_edit_dest",
-                                )
+                                borig = c1.selectbox("Origem", ([f"{borig_cur.nome} (# {tr.banco_origem_id})"] if borig_cur else []) + [f"{r['nome']} (# {r['id']})" for _, r in df_bancos.iterrows()], key="trf_edit_origem")
+                                bdest = c2.selectbox("Destino", ([f"{bdest_cur.nome} (# {tr.banco_destino_id})"] if bdest_cur else []) + [f"{r['nome']} (# {r['id']})" for _, r in df_bancos.iterrows()], key="trf_edit_dest")
                                 valor = c3.number_input("Valor", min_value=0.0, step=100.0, format="%.2f", value=float(tr.valor), key="trf_edit_valor")
                                 data_prev = c4.date_input("Data prevista", value=tr.data_prevista, key="trf_edit_data")
                                 foi = st.checkbox("Executada?", value=bool(tr.foi_executada), key="trf_edit_exec")
                                 data_real = st.date_input("Data real", value=tr.data_real or date.today(), key="trf_edit_data_real") if foi else None
                                 desc = st.text_input("Descrição", value=tr.descricao or "", key="trf_edit_desc")
-                                if st.form_submit_button("Salvar alterações"):
+                                if st.form_submit_button("Salvar alterações", key="trf_edit_save"):
                                     tr.banco_origem_id = extract_id(borig) or tr.banco_origem_id
                                     tr.banco_destino_id = extract_id(bdest) or tr.banco_destino_id
-                                    tr.valor = float(valor)
-                                    tr.data_prevista = data_prev
-                                    tr.foi_executada = foi
-                                    tr.data_real = data_real if foi else None
+                                    tr.valor = float(valor); tr.data_prevista = data_prev
+                                    tr.foi_executada = foi; tr.data_real = (data_real if foi else None)
                                     tr.descricao = desc
                                     _done(s, "Transferência atualizada.")
         with colD:
@@ -1125,114 +1168,250 @@ elif page == "Movimentações":
 # ===========================
 elif page == "Relatórios":
     st.header("Relatórios")
-    filt = st.columns(4)
-    ini = filt[0].date_input("Início", value=date.today().replace(day=1), key="rel_ini")
-    fim = filt[1].date_input("Fim", value=date.today(), key="rel_fim")
+
+    f1, f2, f3 = st.columns(3)
+    tipo_filtro = f1.selectbox("Tipo", ["Entradas e Saídas", "Entradas", "Saídas"], index=0, key="rel_tipo")
+    dt_ini = f2.date_input("De", value=date.today().replace(day=1), key="rel_de")
+    dt_fim = f3.date_input("Até", value=date.today(), key="rel_ate")
+
+    tipo_sql = ""
+    if tipo_filtro == "Entradas":
+        tipo_sql = "AND t.tipo='Entrada'"
+    elif tipo_filtro == "Saídas":
+        tipo_sql = "AND t.tipo='Saida'"
+
     with get_session() as s:
-        ccs = pd.read_sql("SELECT id, nome FROM centros_custo ORDER BY nome", s.bind)
-    cc_opt = filt[2].selectbox("Centro de Custo", ["Geral"] + [f"{r['nome']} (# {r['id']})" for _,r in ccs.iterrows()], key="rel_cc")
-    tipo_rel = filt[3].selectbox("Tipo", ["Fluxo Previsto","Fluxo Realizado","Previsto x Realizado","Extrato"], key="rel_tipo")
-    cc_id = None if cc_opt=="Geral" else extract_id(cc_opt)
+        df_rel = pd.read_sql(
+            f"""
+            SELECT t.id, t.tipo, c.nome AS categoria, s2.nome AS subcategoria, t.valor,
+                   t.data_prevista, t.foi_pago, t.data_real, b.nome AS banco, t.descricao
+            FROM transacoes t
+            JOIN categorias c ON c.id=t.categoria_id
+            LEFT JOIN subcategorias s2 ON s2.id=t.subcategoria_id
+            LEFT JOIN bancos b ON b.id=t.banco_id
+            WHERE date(t.data_prevista) BETWEEN :d1 AND :d2
+            {tipo_sql}
+            ORDER BY t.data_prevista ASC, t.id ASC
+            """,
+            s.bind,
+            params={"d1": dt_ini.isoformat(), "d2": dt_fim.isoformat()},
+        )
 
-    if st.button("Gerar", key="rel_gerar"):
-        base_where = f"date(data_prevista) BETWEEN date('{ini}') AND date('{fim}')"
-        if tipo_rel in ("Fluxo Previsto","Previsto x Realizado"):
-            df_prev = df_query(f"""
-                SELECT data_prevista AS data, SUM(CASE WHEN tipo='Entrada' THEN valor ELSE -valor END) AS valor
-                FROM transacoes
-                WHERE {base_where} {"AND centro_custo_id="+str(cc_id) if cc_id else ""}
-                GROUP BY data_prevista ORDER BY data_prevista
-            """)
-        if tipo_rel in ("Fluxo Realizado","Previsto x Realizado"):
-            df_real = df_query(f"""
-                SELECT data_real AS data, SUM(CASE WHEN tipo='Entrada' THEN valor ELSE -valor END) AS valor
-                FROM transacoes
-                WHERE foi_pago=1 AND data_real IS NOT NULL
-                  AND date(data_real) BETWEEN date('{ini}') AND date('{fim}')
-                  {"AND centro_custo_id="+str(cc_id) if cc_id else ""}
-                GROUP BY data_real ORDER BY data_real
-            """)
-        if tipo_rel == "Extrato":
-            dfx = df_query(f"""
-                SELECT t.id, t.tipo, c.nome AS categoria, s2.nome AS subcategoria, t.valor,
-                       t.data_prevista, t.foi_pago, t.data_real,
-                       cc.nome AS centro_custo, cli.nome AS cliente, f.nome AS fornecedor, b.nome AS banco, t.descricao
-                FROM transacoes t
-                JOIN categorias c ON c.id=t.categoria_id
-                LEFT JOIN subcategorias s2 ON s2.id=t.subcategoria_id
-                LEFT JOIN centros_custo cc ON cc.id=t.centro_custo_id
-                LEFT JOIN clientes cli ON cli.id=t.cliente_id
-                LEFT JOIN fornecedores f ON f.id=t.fornecedor_id
-                LEFT JOIN bancos b ON b.id=t.banco_id
-                WHERE {base_where} {"AND t.centro_custo_id="+str(cc_id) if cc_id else ""}
-                ORDER BY t.data_prevista ASC
-            """)
-            st.dataframe(dfx, use_container_width=True)
-            if not dfx.empty:
-                saldo_liq = dfx[dfx['tipo']=="Entrada"]["valor"].sum() - dfx[dfx['tipo']=="Saida"]["valor"].sum()
-                st.metric("Saldo líquido no período", money(saldo_liq))
-            else:
-                st.info("Sem dados no período.")
-        elif tipo_rel in ("Fluxo Previsto","Fluxo Realizado"):
-            df_show = df_prev if tipo_rel=="Fluxo Previsto" else df_real
-            if df_show.empty:
-                st.info("Sem dados para o período.")
-            else:
-                st.dataframe(df_show, use_container_width=True)
-                fig = px.bar(df_show, x="data", y="valor", title=tipo_rel)
-                st.plotly_chart(fig, use_container_width=True)
-        elif tipo_rel == "Previsto x Realizado":
-            has_prev = ('df_prev' in locals()) and not df_prev.empty
-            has_real = ('df_real' in locals()) and not df_real.empty
-            if has_prev or has_real:
-                if has_prev: df_prev["serie"] = "Previsto"
-                if has_real: df_real["serie"] = "Realizado"
-                comp = pd.concat([x for x in [df_prev if has_prev else None, df_real if has_real else None] if x is not None], ignore_index=True)
-                st.dataframe(comp, use_container_width=True)
-                fig = px.line(comp, x="data", y="valor", color="serie", markers=True, title="Previsto x Realizado")
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("Sem dados para o período.")
+    st.dataframe(df_rel, use_container_width=True)
+    colT1, colT2, colT3 = st.columns(3)
+    tot_e = df_rel.loc[df_rel["tipo"] == "Entrada", "valor"].sum()
+    tot_s = df_rel.loc[df_rel["tipo"] == "Saida", "valor"].sum()
+    with colT1: st.metric("Total Entradas", money(tot_e))
+    with colT2: st.metric("Total Saídas", money(tot_s))
+    with colT3: st.metric("Resultado", money(tot_e - tot_s))
+
+    if not df_rel.empty:
+        csv = df_rel.to_csv(index=False).encode("utf-8-sig")
+        st.download_button("Exportar CSV", data=csv, file_name="relatorio.csv", mime="text/csv")
 
 # ===========================
-# Dashboards
+# Painéis / Dashboards
 # ===========================
-elif page == "Dashboards":
-    st.header("Dashboards")
+elif page in ("Painéis", "Dashboards"):
+    st.header("Painéis / Dashboards")
 
-    # Top categorias (realizado)
-    dfc = df_query("""
-        SELECT c.tipo, c.nome AS categoria, SUM(t.valor) AS valor
-        FROM transacoes t JOIN categorias c ON c.id=t.categoria_id
-        WHERE t.foi_pago=1 AND t.data_real IS NOT NULL
-        GROUP BY c.tipo, c.nome
-        ORDER BY 1, 3 DESC
-    """)
-    if dfc.empty:
-        st.info("Sem realizados ainda.")
+    # Só vamos usar 'config' no st.plotly_chart (para acabar com o aviso)
+    PLOTLY_CONFIG = {
+        "displaylogo": False,
+        "modeBarButtonsToRemove": ["zoomIn2d", "zoomOut2d", "autoScale2d"],
+        "toImageButtonOptions": {"format": "png", "filename": "grafico"},
+        "scrollZoom": False,
+    }
+
+    # ---------------- Filtros de período ----------------
+    colf = st.columns(3)
+    dt_ini = colf[0].date_input(
+        "Início da análise", value=date(date.today().year, 1, 1), key="dash_ini"
+    )
+    dt_fim = colf[1].date_input(
+        "Fim da análise", value=date.today(), key="dash_fim"
+    )
+    colf[2].markdown("O **acumulado** começa exatamente na data de *Início da análise*.")
+
+    if dt_ini > dt_fim:
+        st.warning("Período inválido (início > fim). Ajustei automaticamente.")
+        dt_ini, dt_fim = dt_fim, dt_ini
+
+    # ---------------- Carregar dados ----------------
+    with get_session() as s:
+        # Realizado (pagos) no período -> usa data_real
+        df_real = pd.read_sql(
+            """
+            SELECT t.id, t.tipo, t.valor,
+                   t.data_prevista, t.foi_pago, t.data_real,
+                   c.nome AS categoria, cc.nome AS centro_custo
+            FROM transacoes t
+            JOIN categorias c ON c.id = t.categoria_id
+            LEFT JOIN centros_custo cc ON cc.id = t.centro_custo_id
+            WHERE t.foi_pago = 1
+              AND date(t.data_real) BETWEEN :ini AND :fim
+            """,
+            s.bind, params={"ini": dt_ini.isoformat(), "fim": dt_fim.isoformat()}
+        )
+
+        # Previsto (não pagos) no período -> usa data_prevista
+        df_prev = pd.read_sql(
+            """
+            SELECT t.id, t.tipo, t.valor,
+                   t.data_prevista, t.foi_pago, t.data_real,
+                   c.nome AS categoria, cc.nome AS centro_custo
+            FROM transacoes t
+            JOIN categorias c ON c.id = t.categoria_id
+            LEFT JOIN centros_custo cc ON cc.id = t.centro_custo_id
+            WHERE t.foi_pago = 0
+              AND date(t.data_prevista) BETWEEN :ini AND :fim
+            """,
+            s.bind, params={"ini": dt_ini.isoformat(), "fim": dt_fim.isoformat()}
+        )
+
+    st.divider()
+
+    # ============================================================
+    # 1) Fluxo mensal (Realizado) — Entradas x Saídas (colunas)
+    # ============================================================
+    st.subheader("Fluxo mensal (Realizado) — Entradas x Saídas")
+    if not df_real.empty:
+        dfm = df_real.copy()
+        dfm["Mês"] = pd.to_datetime(dfm["data_real"]).dt.to_period("M").astype(str)
+        g = (
+            dfm.groupby(["Mês", "tipo"], as_index=False)["valor"]
+            .sum()
+            .pivot(index="Mês", columns="tipo", values="valor")
+            .fillna(0.0)
+            .reset_index()
+        )
+        if "Entrada" not in g.columns: g["Entrada"] = 0.0
+        if "Saida"   not in g.columns: g["Saida"]   = 0.0
+
+        fig1 = px.bar(
+            g,
+            x="Mês",
+            y=["Entrada", "Saida"],
+            barmode="group",
+            title=(
+                f"Entradas x Saídas (Realizado) por mês — "
+                f"{dt_ini.strftime('%d/%m/%Y')} a {dt_fim.strftime('%d/%m/%Y')}"
+            ),
+            template="plotly_white",
+        )
+        fig1.update_layout(
+            legend_title_text="",
+            margin=dict(l=10, r=10, t=50, b=10),
+            yaxis_title="R$",
+        )
+        st.plotly_chart(fig1, config=PLOTLY_CONFIG)
     else:
-        col1, col2 = st.columns(2)
-        with col1:
-            fig1 = px.bar(dfc[dfc["tipo"]=="Entrada"], x="categoria", y="valor", title="Top Entradas por Categoria")
-            st.plotly_chart(fig1, use_container_width=True)
-        with col2:
-            fig2 = px.bar(dfc[dfc["tipo"]=="Saida"], x="categoria", y="valor", title="Top Saídas por Categoria")
-            st.plotly_chart(fig2, use_container_width=True)
+        st.info("Sem movimentos **realizados** no período para montar o fluxo mensal.")
 
-    # Curva de caixa (acumulado real por data)
-    dfd = df_query("""
-        SELECT date(data_real) AS data, SUM(CASE WHEN tipo='Entrada' THEN valor ELSE -valor END) AS delta
-        FROM transacoes WHERE foi_pago=1 AND data_real IS NOT NULL
-        GROUP BY date(data_real) ORDER BY date(data_real)
-    """)
-    if not dfd.empty:
-        dfd["saldo"] = dfd["delta"].cumsum()
-        fig3 = px.line(dfd, x="data", y="saldo", title="Saldo acumulado (real)")
-        st.plotly_chart(fig3, use_container_width=True)
+    st.divider()
 
-    # Saldos por banco (pizza)
-    dfb = compute_bank_balances()
-    if not dfb.empty:
-        fig4 = px.pie(dfb, names="nome", values="saldo_atual", title="Distribuição de saldos por banco")
-        st.plotly_chart(fig4, use_container_width=True)
+    # ===========================================
+    # 2) Fluxo de Caixa — Saldo Acumulado (linha)
+    # ===========================================
+    st.subheader("Fluxo de Caixa — Saldo Acumulado (Realizado)")
+    if not df_real.empty:
+        acc = df_real.copy()
+        acc["dia"] = pd.to_datetime(acc["data_real"]).dt.date
+        acc["var"] = acc.apply(lambda r: r["valor"] if r["tipo"] == "Entrada" else -r["valor"], axis=1)
 
+        daily = acc.groupby("dia", as_index=False)["var"].sum().sort_values("dia")
+        # Linha contínua (preenche dias sem movimento)
+        idx = pd.date_range(start=dt_ini, end=dt_fim, freq="D")
+        daily = (
+            daily.set_index("dia")
+            .reindex(idx, fill_value=0.0)
+            .rename_axis("dia").reset_index()
+        )
+        daily["acumulado"] = daily["var"].cumsum()
+        daily["dia"] = pd.to_datetime(daily["dia"]).dt.date
+
+        fig2 = px.line(
+            daily,
+            x="dia", y="acumulado",
+            markers=True,
+            title=f"Saldo acumulado (de {dt_ini.strftime('%d/%m/%Y')} até {dt_fim.strftime('%d/%m/%Y')})",
+            template="plotly_white",
+        )
+        fig2.update_layout(
+            xaxis_title="Data",
+            yaxis_title="R$",
+            margin=dict(l=10, r=10, t=50, b=10),
+        )
+        st.plotly_chart(fig2, config={**PLOTLY_CONFIG, "toImageButtonOptions": {"format": "png", "filename": "saldo_acumulado"}})
+    else:
+        st.info("Sem movimentos **realizados** no período para montar o acumulado.")
+
+    st.divider()
+
+    # ============================================================
+    # 3) Previsto vs. Realizado por Centro de Custo (barra agrupada)
+    # ============================================================
+    st.subheader("Previsto vs. Realizado por Centro de Custo")
+
+    prev_cc = pd.DataFrame(columns=["centro_custo", "previsto"])
+    if not df_prev.empty:
+        p = df_prev.copy()
+        p["centro_custo"] = p["centro_custo"].fillna("(sem CC)")
+        prev_cc = p.groupby("centro_custo", as_index=False)["valor"].sum().rename(columns={"valor": "previsto"})
+
+    real_cc = pd.DataFrame(columns=["centro_custo", "realizado"})
+    if not df_real.empty:
+        r = df_real.copy()
+        r["centro_custo"] = r["centro_custo"].fillna("(sem CC)")
+        real_cc = r.groupby("centro_custo", as_index=False)["valor"].sum().rename(columns={"valor": "realizado"})
+
+    comp_cc = pd.merge(prev_cc, real_cc, on="centro_custo", how="outer").fillna(0.0)
+    if comp_cc.empty:
+        st.info("Sem dados de **previsto/realizado** por Centro de Custo no período.")
+    else:
+        comp_cc_long = comp_cc.melt(
+            id_vars="centro_custo",
+            value_vars=["previsto", "realizado"],
+            var_name="Tipo", value_name="Valor",
+        )
+        fig3 = px.bar(
+            comp_cc_long,
+            x="centro_custo", y="Valor",
+            color="Tipo", barmode="group",
+            title="Previsto vs. Realizado por Centro de Custo (período selecionado)",
+            template="plotly_white",
+        )
+        fig3.update_layout(
+            xaxis_title="Centro de Custo",
+            yaxis_title="R$",
+            legend_title_text="",
+            margin=dict(l=10, r=10, t=50, b=10),
+        )
+        st.plotly_chart(fig3, config={**PLOTLY_CONFIG, "toImageButtonOptions": {"format": "png", "filename": "previsto_vs_realizado_cc"}})
+
+    st.divider()
+
+    # ===========================================
+    # 4) Gastos por Categoria (Saídas — Realizado)
+    # ===========================================
+    st.subheader("Gastos por Categoria (Saídas — Realizado)")
+    if not df_real.empty:
+        saidas = df_real[df_real["tipo"] == "Saida"].copy()
+        if saidas.empty:
+            st.info("Não há **saídas realizadas** no período.")
+        else:
+            gcat = saidas.groupby("categoria", as_index=False)["valor"].sum().sort_values("valor", ascending=False)
+            fig4 = px.bar(
+                gcat,
+                x="categoria", y="valor",
+                title="Total de Saídas por Categoria (Realizado)",
+                template="plotly_white",
+            )
+            fig4.update_layout(
+                xaxis_title="Categoria",
+                yaxis_title="R$",
+                margin=dict(l=10, r=10, t=50, b=10),
+            )
+            st.plotly_chart(fig4, config={**PLOTLY_CONFIG, "toImageButtonOptions": {"format": "png", "filename": "gastos_por_categoria"}})
+    else:
+        st.info("Sem movimentos **realizados** para compor *Gastos por Categoria*.")
