@@ -1,0 +1,17 @@
+# Arquivo de secrets - NÃO subir credenciais
+secrets.toml
+.streamlit/secrets.toml
+
+# Pasta de anexos e arquivos gerados localmente
+anexos/
+
+# Cache do Python
+__pycache__/
+
+# Arquivos SQLite
+*.db
+
+# Outros arquivos temporários
+*.pyc
+*.pyo
+*.log
