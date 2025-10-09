@@ -1,128 +1,95 @@
 # -*- coding: utf-8 -*-
-
 # BK Engenharia e Tecnologia — App de Gestão Financeira (arquivo único)
 # Python: 3.13 | Streamlit + SQLAlchemy | SQLite/Cloud
 
 from __future__ import annotations
 
-import plotly.express as px
-import os, io, re
+import os, io, re, unicodedata, warnings
 from datetime import date, datetime, timedelta
-import warnings
-warnings.filterwarnings("ignore", message="The keyword arguments have been deprecated")
+from urllib.parse import urlparse, quote, unquote
 from dateutil.relativedelta import relativedelta
 from typing import Optional
-import pandas as pd
 
+import pandas as pd
+import plotly.express as px
 import streamlit as st
 
-# ==== IMPORTS SQLALCHEMY (corrigidos) ====
-from sqlalchemy import create_engine
+# ==== IMPORTS SQLALCHEMY ====
+from sqlalchemy import create_engine, Column, Integer, String, Float, Date, DateTime, Boolean, Text, ForeignKey, func
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
-from sqlalchemy import Column, Integer, String, Float, Date, DateTime, Boolean, Text, ForeignKey, func
-import os
+
+warnings.filterwarnings("ignore", message="The keyword arguments have been deprecated")
 
 # ===========================
 # Configurações Gerais
 # ===========================
 APP_TITLE = "BK Gestão Financeira"
-APP_VERSION = "v1.8"
+APP_VERSION = "v1.9"
 
-# --- utilitários para normalizar caminho/URL do SQLite e garantir pasta ---
-from urllib.parse import urlparse, quote, unquote
+st.set_page_config(page_title=APP_TITLE, page_icon="💼", layout="wide", initial_sidebar_state="expanded")
 
-def _to_sqlite_url(path_or_url: str) -> str:
-    """
-    Aceita:
-      - caminho Windows (C:\\...\\bk_finance.db)
-      - sqlite:///C:/.../bk_finance.db
-      - sqlite:////C:/.../bk_finance.db
-    Normaliza SEMPRE para sqlite:////C:/.../bk_finance.db com URL-encode seguro.
-    """
-    s = str(path_or_url or "").strip()
-
-    # Se já vier com esquema sqlite:
-    if s.lower().startswith("sqlite:"):
-        p = urlparse(s)
-        path = unquote(p.path or "")
-        # Em Windows costuma vir "/C:/..." -> remove a barra inicial
-        if re.match(r"^/[A-Za-z]:", path):
-            path = path[1:]
-        path = path.replace("\\", "/")
-        enc = quote(path)
-        return f"sqlite:////{enc}"
-
-    # Se for caminho de arquivo (sem esquema)
-    p = s.replace("\\", "/")
-    # Absoluto tipo "C:/..."
-    if re.match(r"^[A-Za-z]:/", p):
-        enc = quote(p)
-        return f"sqlite:////{enc}"
-    # Relativo -> resolve para ./data
-    base_dir = os.path.abspath(os.path.dirname(__file__))
-    full = os.path.abspath(os.path.join(base_dir, p))
-    full = full.replace("\\", "/")
-    enc = quote(full)
-    return f"sqlite:////{enc}"
-
-def _ensure_sqlite_dir(db_url: str) -> None:
-    """Cria a pasta do arquivo .db caso não exista (SQLite não cria diretórios)."""
-    if not str(db_url).lower().startswith("sqlite:"):
-        return
-    parsed = urlparse(db_url)
-    path = unquote(parsed.path or "")
-    if re.match(r"^/[A-Za-z]:", path):
-        path = path[1:]
-    path = path.replace("\\", "/")
-    folder = os.path.dirname(path)
-    if folder and not os.path.exists(folder):
-        os.makedirs(folder, exist_ok=True)
-
-# 1) DB_URL por env ou secrets (se usar secrets.toml, seção [general])
-DB_URL = (
-    os.environ.get("DATABASE_URL")
-    or (st.secrets.get("general", {}).get("database_url") if hasattr(st, "secrets") else None)
-)
-
-# 2) Fallback local: ./data/bk_finance.db
-if not DB_URL:
-    BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-    LOCAL_DB_DIR = os.path.join(BASE_DIR, "data")
-    os.makedirs(LOCAL_DB_DIR, exist_ok=True)
-    DB_URL = f"sqlite:///{os.path.join(LOCAL_DB_DIR, 'bk_finance.db')}"
-
+# ===========================
+# Helpers de URL/FS para SQLite
+# ===========================
 def _is_sqlite(url: str) -> bool:
     return str(url).lower().startswith("sqlite:")
 
 def _ensure_sqlite_dir_if_needed(url: str) -> None:
-    """Garante a pasta apenas quando for SQLite (arquivo local)."""
+    """Garante a pasta do arquivo SQLite."""
     if not _is_sqlite(url):
         return
-    # extrai o caminho do arquivo após 'sqlite:///' (sem mexer em URLs postgres)
     path = url.replace("sqlite:///", "", 1)
-    # normaliza 'C:/' vs '/C:/' em Windows
     if path.startswith("/") and len(path) > 2 and path[2] == ":":
         path = path[1:]
     folder = os.path.dirname(path)
     if folder and not os.path.exists(folder):
         os.makedirs(folder, exist_ok=True)
 
-# 3) Garante pasta somente para SQLite
+def _sanitize_filename(name: str) -> str:
+    name = os.path.basename(name)
+    name = unicodedata.normalize("NFKD", name)
+    name = name.encode("ascii", "ignore").decode("ascii")
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+    return name.strip("._") or "arquivo"
+
+# ===========================
+# Secrets/Config (robusto com fallback)
+# ===========================
+def _get_secret(section: str, key: str, default=None):
+    try:
+        sect = st.secrets.get(section, {})
+        # st.secrets pode não ter .get (dependendo do host), por isso forçamos dict()
+        if not isinstance(sect, dict):
+            sect = dict(sect)
+        return sect.get(key, default)
+    except Exception:
+        return default
+
+DB_URL = os.environ.get("DATABASE_URL") or _get_secret("general", "database_url")
+ATTACH_DIR = os.environ.get("ATTACH_DIR") or _get_secret("general", "attach_dir", "anexos")
+
+# Fallback local caso não tenha secrets/env:
+if not DB_URL:
+    base_dir = os.path.abspath(os.path.dirname(__file__))
+    local_data_dir = os.path.join(base_dir, "data")
+    os.makedirs(local_data_dir, exist_ok=True)
+    DB_URL = f"sqlite:///{os.path.join(local_data_dir, 'bk_finance.db')}"
+
+# Pastas
+os.makedirs(ATTACH_DIR, exist_ok=True)
 _ensure_sqlite_dir_if_needed(DB_URL)
 
-# 4) Engine e Session (compatível com Postgres e SQLite)
+# ===========================
+# Engine e Session (com pool no Postgres)
+# ===========================
 connect_args = {"check_same_thread": False} if _is_sqlite(DB_URL) else {}
-ENGINE = create_engine(DB_URL, echo=False, future=True, connect_args=connect_args)
+pool_kwargs = {}
+if not _is_sqlite(DB_URL):
+    pool_kwargs = dict(pool_size=5, max_overflow=10, pool_pre_ping=True, pool_recycle=1800)
+
+ENGINE = create_engine(DB_URL, echo=False, future=True, connect_args=connect_args, **pool_kwargs)
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, autocommit=False, expire_on_commit=False)
 Base = declarative_base()
-
-# 6) Pasta de anexos
-ATTACH_DIR = (
-    os.environ.get("ATTACH_DIR")
-    or (st.secrets.get("general", {}).get("attach_dir") if hasattr(st, "secrets") else None)
-    or os.path.join(os.path.abspath(os.path.dirname(__file__)), "anexos")
-)
-os.makedirs(ATTACH_DIR, exist_ok=True)
 
 # ===========================
 # Models
@@ -251,7 +218,6 @@ def ensure_seed_data():
             s.add(CentroCusto(nome="Geral", descricao="Padrão"))
         s.commit()
 
-# helper commit + limpar cache + rerun
 def _done(session, msg: str):
     session.commit()
     st.cache_data.clear()
@@ -281,10 +247,12 @@ def compute_bank_balances() -> pd.DataFrame:
             SELECT banco_origem_id AS banco_id, COALESCE(SUM(valor),0) AS total
             FROM transferencias WHERE foi_executada=1 GROUP BY banco_origem_id
         """, s.bind)
+
         def get_total(df, bank_id):
             if df.empty: return 0.0
             r = df[df["banco_id"] == bank_id]
             return float(r.iloc[0]["total"]) if not r.empty else 0.0
+
         rows = []
         for _, r in bancos.iterrows():
             bid = int(r["id"]); saldo = float(r["saldo_inicial"])
@@ -338,8 +306,6 @@ def make_recibo_pdf(transacao: Transacao, session) -> bytes:
 # ===========================
 # STREAMLIT
 # ===========================
-st.set_page_config(page_title=APP_TITLE, page_icon="💼", layout="wide", initial_sidebar_state="expanded")
-
 @st.cache_data(show_spinner=False)
 def df_query_cached(sql: str) -> pd.DataFrame:
     return df_query(sql)
@@ -354,8 +320,9 @@ with st.sidebar:
     st.caption(APP_VERSION)
     page = st.radio("Navegação", ["Home","Cadastro","Metas","Movimentações","Relatórios","Dashboards"], index=0, key="nav_page")
     st.divider()
-    st.markdown("**Banco de Dados (URL/arquivo)**")
-    st.code(DB_URL, language="bash")
+    # ⚠️ Removido para não vazar credenciais:
+    # st.markdown("**Banco de Dados (URL/arquivo)**")
+    # st.code(DB_URL, language="bash")
 
 st.markdown("""
 <style>
@@ -365,12 +332,10 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ------------- helpers CRUD -------------
 def input_id_to_edit_delete(df: pd.DataFrame, label="ID", key: str = None):
     ids = [int(x) for x in (df["id"].tolist() if "id" in df.columns else [])]
     if not ids:
-        st.info("Nenhum registro.")
-        return None
+        st.info("Nenhum registro."); return None
     return st.selectbox(label, ids, index=0, key=key)
 
 def load_obj(session, model, obj_id: int):
@@ -411,21 +376,38 @@ if page == "Home":
         st.dataframe(df[["id","tipo","valor","data_prevista","foi_pago","data_real","descricao"]], use_container_width=True)
 
     st.subheader("Atrasados — Entradas/Saídas não pagas")
-    atrasados = df_query("""
-        SELECT t.id, t.tipo, c.nome AS categoria, s2.nome AS subcategoria, t.valor,
-               t.data_prevista, cc.nome AS centro_custo,
-               cli.nome AS cliente, f.nome AS fornecedor, b.nome AS banco, t.descricao,
-               CAST(julianday('now') - julianday(t.data_prevista) AS INT) AS dias_atraso
-        FROM transacoes t
-        JOIN categorias c ON c.id=t.categoria_id
-        LEFT JOIN subcategorias s2 ON s2.id=t.subcategoria_id
-        LEFT JOIN centros_custo cc ON cc.id=t.centro_custo_id
-        LEFT JOIN clientes cli ON cli.id=t.cliente_id
-        LEFT JOIN fornecedores f ON f.id=t.fornecedor_id
-        LEFT JOIN bancos b ON b.id=t.banco_id
-        WHERE t.foi_pago=0 AND date(t.data_prevista) < date('now')
-        ORDER BY t.data_prevista ASC
-    """)
+    if _is_sqlite(DB_URL):
+        atrasados = df_query("""
+            SELECT t.id, t.tipo, c.nome AS categoria, s2.nome AS subcategoria, t.valor,
+                   t.data_prevista, cc.nome AS centro_custo,
+                   cli.nome AS cliente, f.nome AS fornecedor, b.nome AS banco, t.descricao,
+                   CAST(julianday('now') - julianday(t.data_prevista) AS INT) AS dias_atraso
+            FROM transacoes t
+            JOIN categorias c ON c.id=t.categoria_id
+            LEFT JOIN subcategorias s2 ON s2.id=t.subcategoria_id
+            LEFT JOIN centros_custo cc ON cc.id=t.centro_custo_id
+            LEFT JOIN clientes cli ON cli.id=t.cliente_id
+            LEFT JOIN fornecedores f ON f.id=t.fornecedor_id
+            LEFT JOIN bancos b ON b.id=t.banco_id
+            WHERE t.foi_pago=0 AND date(t.data_prevista) < date('now')
+            ORDER BY t.data_prevista ASC
+        """)
+    else:
+        atrasados = df_query("""
+            SELECT t.id, t.tipo, c.nome AS categoria, s2.nome AS subcategoria, t.valor,
+                   t.data_prevista, cc.nome AS centro_custo,
+                   cli.nome AS cliente, f.nome AS fornecedor, b.nome AS banco, t.descricao,
+                   (CURRENT_DATE - t.data_prevista) AS dias_atraso
+            FROM transacoes t
+            JOIN categorias c ON c.id=t.categoria_id
+            LEFT JOIN subcategorias s2 ON s2.id=t.subcategoria_id
+            LEFT JOIN centros_custo cc ON cc.id=t.centro_custo_id
+            LEFT JOIN clientes cli ON cli.id=t.cliente_id
+            LEFT JOIN fornecedores f ON f.id=t.fornecedor_id
+            LEFT JOIN bancos b ON b.id=t.banco_id
+            WHERE t.foi_pago=0 AND DATE(t.data_prevista) < CURRENT_DATE
+            ORDER BY t.data_prevista ASC
+        """)
     if atrasados.empty: st.success("Não há lançamentos em atraso. 🎉")
     else:
         cE, cS = st.columns(2)
@@ -539,7 +521,7 @@ elif page == "Cadastro":
                         if obj:
                             s.delete(obj); _done(s, "Fornecedor excluído.")
 
-        # ---------- Bancos ----------
+    # ---------- Bancos ----------
     with tabs[2]:
         st.subheader("Bancos — Incluir")
         with st.form("form_banco_add", clear_on_submit=True):
@@ -588,7 +570,6 @@ elif page == "Cadastro":
         with st.form("form_cat_add", clear_on_submit=True):
             c1,c2 = st.columns(2)
             tipo = c1.selectbox("Tipo", ["Entrada","Saida"], key="cat_add_tipo")
-            # Nome com lista suspensa vinculada ao tipo (nomes existentes aparecem para facilitar padronização)
             with get_session() as s:
                 nomes_exist = pd.read_sql("SELECT DISTINCT nome FROM categorias WHERE tipo=:t ORDER BY nome", s.bind, params={"t": tipo})
             sugestoes = nomes_exist["nome"].tolist() if not nomes_exist.empty else []
@@ -644,11 +625,9 @@ elif page == "Cadastro":
             if cats.empty:
                 st.info("Cadastre categorias primeiro."); st.form_submit_button("Adicionar", disabled=True)
             else:
-                # seleção por tipo primeiro
                 tipo_sel = c1.selectbox("Tipo", ["Entrada", "Saida"], key="sub_add_tipo")
                 cats_tipo = cats[cats["tipo"] == tipo_sel]
                 cat_opt = c1.selectbox("Categoria", [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _,r in cats_tipo.iterrows()], key="sub_add_cat")
-                # Nome com sugestões (vinculado à categoria escolhida)
                 with get_session() as s:
                     nomes_exist = pd.read_sql("SELECT DISTINCT nome FROM subcategorias WHERE categoria_id=:c ORDER BY nome", s.bind, params={"c": extract_id(cat_opt)})
                 sugestoes = nomes_exist["nome"].tolist() if not nomes_exist.empty else []
@@ -678,15 +657,12 @@ elif page == "Cadastro":
                         if obj:
                             with st.form("form_sub_edit"):
                                 c1,c2 = st.columns(2)
-                                # tipo primeiro
                                 tipo_sel = c1.selectbox("Tipo", ["Entrada","Saida"], index=0 if s.get(Categoria, obj.categoria_id).tipo=="Entrada" else 1, key="sub_edit_tipo")
                                 cats_tipo = cats[cats["tipo"] == tipo_sel]
-                                # categoria da mesma linha como primeira opção
                                 cat_obj = s.get(Categoria, obj.categoria_id)
                                 cat_label_cur = f"{cat_obj.tipo} - {cat_obj.nome} (# {cat_obj.id})" if cat_obj else "-"
                                 opts = [cat_label_cur] + [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _,r in cats_tipo.iterrows() if f"{r['tipo']} - {r['nome']} (# {r['id']})" != cat_label_cur]
                                 escolha = c1.selectbox("Categoria", opts, key="sub_edit_cat")
-                                # nome com sugestões vinculadas à categoria escolhida
                                 new_cat_id = extract_id(escolha) or obj.categoria_id
                                 nomes_exist = pd.read_sql("SELECT DISTINCT nome FROM subcategorias WHERE categoria_id=:c ORDER BY nome", s.bind, params={"c": new_cat_id})
                                 sugestoes = nomes_exist["nome"].tolist() if not nomes_exist.empty else []
@@ -845,8 +821,7 @@ elif page == "Movimentações":
 
     # --------- Lançamentos (ADD) ---------
     with tabs[0]:
-
-        # -------- DADOS AUXILIARES --------
+        # DADOS AUXILIARES
         with get_session() as s:
             df_cat_all = pd.read_sql("SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome", s.bind)
             df_sub_all = pd.read_sql("SELECT id, categoria_id, nome FROM subcategorias ORDER BY nome", s.bind)
@@ -855,25 +830,17 @@ elif page == "Movimentações":
             df_forn_all= pd.read_sql("SELECT id, nome FROM fornecedores ORDER BY nome", s.bind)
             df_bco_all = pd.read_sql("SELECT id, nome FROM bancos ORDER BY nome", s.bind)
 
-        # =========================
-        # Incluir Lançamento
-        # =========================
         st.subheader("Incluir Lançamento")
         with st.form("form_tx_add", clear_on_submit=True):
             c1, c2, c3, c4 = st.columns(4)
-
             tipo_add = c1.selectbox("Tipo", ["Entrada", "Saida"], key="tx_add_tipo")
-            # categorias só do tipo escolhido
             cat_rows = df_cat_all[df_cat_all["tipo"] == tipo_add]
             cat_opts = [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _, r in cat_rows.iterrows()]
             cat_add  = c2.selectbox("Categoria", cat_opts, placeholder="Selecione", key="tx_add_cat")
-
-            # subcategorias daquela categoria
             cat_id_add = extract_id(cat_add) if cat_add else None
             sub_rows = df_sub_all[df_sub_all["categoria_id"] == (cat_id_add or -1)]
             sub_opts = ["-"] + [f"{r['nome']} (# {r['id']})" for _, r in sub_rows.iterrows()]
             sub_add  = c3.selectbox("Subcategoria", sub_opts, key="tx_add_sub")
-
             valor_add = c4.number_input("Valor (R$)", min_value=0.0, step=100.0, format="%.2f", key="tx_add_valor")
 
             d1, d2, d3, d4 = st.columns(4)
@@ -902,7 +869,6 @@ elif page == "Movimentações":
                 parcelas_total_add = r2.number_input("Nº de parcelas", min_value=1, max_value=120, value=2, key="tx_add_parc_n")
                 periodicidade_add = r3.selectbox("Periodicidade", ["Mensal", "Anual"], key="tx_add_parc_per")
 
-            # --- SUBMIT ---
             if st.form_submit_button("Lançar"):
                 if not cat_id_add:
                     error("Selecione a categoria."); st.stop()
@@ -930,14 +896,11 @@ elif page == "Movimentações":
 
                     if recorr_add == "Unica":
                         add_tx(None, data_prev_add)
-
                     elif recorr_add in ("Mensal", "Anual"):
-                        # 12 meses / 5 anos como exemplo de planejamento
                         steps = 12 if recorr_add == "Mensal" else 5
                         for i in range(steps):
                             dt = data_prev_add + (relativedelta(months=i) if recorr_add == "Mensal" else relativedelta(years=i))
                             add_tx(None, dt)
-
                     elif recorr_add == "Parcelado":
                         total = int(parcelas_total_add or 1)
                         for i in range(1, total + 1):
@@ -946,9 +909,7 @@ elif page == "Movimentações":
 
                     _done(s, "Movimentação(ões) lançada(s).")
 
-        # =========================
-        # Lista + Editar / Excluir
-        # =========================
+        # Lista + Editar/Excluir
         st.subheader("Lançamentos — Lista")
         with get_session() as s:
             df_tx = pd.read_sql(
@@ -971,7 +932,7 @@ elif page == "Movimentações":
 
         colE, colD = st.columns(2)
 
-        # ---------- Editar ----------
+        # Editar
         with colE:
             st.markdown("**Editar Lançamento**")
             if df_tx.empty:
@@ -986,19 +947,16 @@ elif page == "Movimentações":
                                 c1, c2, c3, c4 = st.columns(4)
                                 tipo_ed = c1.selectbox("Tipo", ["Entrada", "Saida"], index=0 if t.tipo == "Entrada" else 1, key="tx_edit_tipo")
 
-                                # categorias do tipo escolhido
                                 df_cat_typ = pd.read_sql(
                                     "SELECT id, tipo, nome FROM categorias WHERE tipo=:tp ORDER BY nome",
                                     s.bind,
                                     params={"tp": tipo_ed},
                                 )
-                                # label atual
                                 cat_cur = s.get(Categoria, t.categoria_id)
                                 cat_label_cur = f"{cat_cur.tipo} - {cat_cur.nome} (# {cat_cur.id})" if cat_cur else "-"
                                 cat_opts_ed = [cat_label_cur] + [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _, r in df_cat_typ.iterrows() if f"{r['tipo']} - {r['nome']} (# {r['id']})" != cat_label_cur]
                                 cat_ed = c2.selectbox("Categoria", cat_opts_ed, key="tx_edit_cat")
 
-                                # subcategorias conforme categoria escolhida (ou atual)
                                 cat_id_sel = extract_id(cat_ed) or t.categoria_id
                                 df_sub_typ = pd.read_sql(
                                     "SELECT id, nome FROM subcategorias WHERE categoria_id=:c ORDER BY nome",
@@ -1020,7 +978,6 @@ elif page == "Movimentações":
                                 pago_ed      = d2.checkbox("Pago?", value=bool(t.foi_pago), key="tx_edit_pago")
                                 data_real_ed = d3.date_input("Data Real", value=t.data_real or date.today(), key="tx_edit_data_real") if pago_ed else None
 
-                                # banco
                                 df_bco = pd.read_sql("SELECT id, nome FROM bancos ORDER BY nome", s.bind)
                                 bco_label_cur = "-"
                                 if t.banco_id:
@@ -1031,7 +988,6 @@ elif page == "Movimentações":
                                 bco_ed = d4.selectbox("Banco", bco_opts_ed, key="tx_edit_banco")
 
                                 e1, e2, e3 = st.columns(3)
-                                # CC
                                 df_cc = pd.read_sql("SELECT id, nome FROM centros_custo ORDER BY nome", s.bind)
                                 cc_label_cur = "-"
                                 if t.centro_custo_id:
@@ -1041,7 +997,6 @@ elif page == "Movimentações":
                                 cc_opts_ed = [cc_label_cur] + [f"{r['nome']} (# {r['id']})" for _, r in df_cc.iterrows() if f"{r['nome']} (# {r['id']})" != cc_label_cur]
                                 cc_ed = e1.selectbox("Centro de Custo", cc_opts_ed, key="tx_edit_cc")
 
-                                # cliente / fornecedor
                                 df_cli = pd.read_sql("SELECT id, nome FROM clientes ORDER BY nome", s.bind)
                                 cli_label_cur = "-"
                                 if t.cliente_id:
@@ -1077,7 +1032,7 @@ elif page == "Movimentações":
                                     t.descricao = desc_ed
                                     _done(s, "Lançamento atualizado.")
 
-        # ---------- Excluir ----------
+        # Excluir
         with colD:
             st.markdown("**Excluir Lançamento**")
             if df_tx.empty:
@@ -1091,9 +1046,7 @@ elif page == "Movimentações":
                             s.delete(t)
                             _done(s, "Lançamento excluído.")
 
-        # =========================
         # Anexos / Recibo
-        # =========================
         st.subheader("Anexos e Recibos")
         colA, colB = st.columns([2, 1])
         with colA:
@@ -1110,7 +1063,8 @@ elif page == "Movimentações":
                         error("Transação não encontrada.")
                     else:
                         for f in up or []:
-                            fname = f"T{int(trans_id)}_{int(datetime.utcnow().timestamp())}_{f.name}"
+                            safe = _sanitize_filename(getattr(f, "name", "arquivo"))
+                            fname = f"T{int(trans_id)}_{int(datetime.utcnow().timestamp())}_{safe}"
                             fpath = os.path.join(ATTACH_DIR, fname)
                             with open(fpath, "wb") as fh:
                                 fh.write(f.getbuffer())
@@ -1241,7 +1195,6 @@ elif page == "Movimentações":
 # ===========================
 elif page == "Relatórios":
     st.header("Relatórios")
-
     f1, f2, f3 = st.columns(3)
     tipo_filtro = f1.selectbox("Tipo", ["Entradas e Saídas", "Entradas", "Saídas"], index=0, key="rel_tipo")
     dt_ini = f2.date_input("De", value=date.today().replace(day=1), key="rel_de")
@@ -1262,7 +1215,7 @@ elif page == "Relatórios":
             JOIN categorias c ON c.id=t.categoria_id
             LEFT JOIN subcategorias s2 ON s2.id=t.subcategoria_id
             LEFT JOIN bancos b ON b.id=t.banco_id
-            WHERE date(t.data_prevista) BETWEEN :d1 AND :d2
+            WHERE DATE(t.data_prevista) BETWEEN :d1 AND :d2
             {tipo_sql}
             ORDER BY t.data_prevista ASC, t.id ASC
             """,
@@ -1288,7 +1241,6 @@ elif page == "Relatórios":
 elif page in ("Painéis", "Dashboards"):
     st.header("Painéis / Dashboards")
 
-    # Só vamos usar 'config' no st.plotly_chart (para acabar com o aviso)
     PLOTLY_CONFIG = {
         "displaylogo": False,
         "modeBarButtonsToRemove": ["zoomIn2d", "zoomOut2d", "autoScale2d"],
@@ -1296,23 +1248,16 @@ elif page in ("Painéis", "Dashboards"):
         "scrollZoom": False,
     }
 
-    # ---------------- Filtros de período ----------------
     colf = st.columns(3)
-    dt_ini = colf[0].date_input(
-        "Início da análise", value=date(date.today().year, 1, 1), key="dash_ini"
-    )
-    dt_fim = colf[1].date_input(
-        "Fim da análise", value=date.today(), key="dash_fim"
-    )
+    dt_ini = colf[0].date_input("Início da análise", value=date(date.today().year, 1, 1), key="dash_ini")
+    dt_fim = colf[1].date_input("Fim da análise", value=date.today(), key="dash_fim")
     colf[2].markdown("O **acumulado** começa exatamente na data de *Início da análise*.")
 
     if dt_ini > dt_fim:
         st.warning("Período inválido (início > fim). Ajustei automaticamente.")
         dt_ini, dt_fim = dt_fim, dt_ini
 
-    # ---------------- Carregar dados ----------------
     with get_session() as s:
-        # Realizado (pagos) no período -> usa data_real
         df_real = pd.read_sql(
             """
             SELECT t.id, t.tipo, t.valor,
@@ -1322,12 +1267,10 @@ elif page in ("Painéis", "Dashboards"):
             JOIN categorias c ON c.id = t.categoria_id
             LEFT JOIN centros_custo cc ON cc.id = t.centro_custo_id
             WHERE t.foi_pago = 1
-              AND date(t.data_real) BETWEEN :ini AND :fim
+              AND DATE(t.data_real) BETWEEN :ini AND :fim
             """,
             s.bind, params={"ini": dt_ini.isoformat(), "fim": dt_fim.isoformat()}
         )
-
-        # Previsto (não pagos) no período -> usa data_prevista
         df_prev = pd.read_sql(
             """
             SELECT t.id, t.tipo, t.valor,
@@ -1337,16 +1280,13 @@ elif page in ("Painéis", "Dashboards"):
             JOIN categorias c ON c.id = t.categoria_id
             LEFT JOIN centros_custo cc ON cc.id = t.centro_custo_id
             WHERE t.foi_pago = 0
-              AND date(t.data_prevista) BETWEEN :ini AND :fim
+              AND DATE(t.data_prevista) BETWEEN :ini AND :fim
             """,
             s.bind, params={"ini": dt_ini.isoformat(), "fim": dt_fim.isoformat()}
         )
 
     st.divider()
 
-    # ============================================================
-    # 1) Fluxo mensal (Realizado) — Entradas x Saídas (colunas)
-    # ============================================================
     st.subheader("Fluxo mensal (Realizado) — Entradas x Saídas")
     if not df_real.empty:
         dfm = df_real.copy()
@@ -1360,113 +1300,66 @@ elif page in ("Painéis", "Dashboards"):
         )
         if "Entrada" not in g.columns: g["Entrada"] = 0.0
         if "Saida"   not in g.columns: g["Saida"]   = 0.0
-
         fig1 = px.bar(
-            g,
-            x="Mês",
-            y=["Entrada", "Saida"],
-            barmode="group",
-            title=(
-                f"Entradas x Saídas (Realizado) por mês — "
-                f"{dt_ini.strftime('%d/%m/%Y')} a {dt_fim.strftime('%d/%m/%Y')}"
-            ),
+            g, x="Mês", y=["Entrada", "Saida"], barmode="group",
+            title=(f"Entradas x Saídas (Realizado) por mês — {dt_ini.strftime('%d/%m/%Y')} a {dt_fim.strftime('%d/%m/%Y')}"),
             template="plotly_white",
         )
-        fig1.update_layout(
-            legend_title_text="",
-            margin=dict(l=10, r=10, t=50, b=10),
-            yaxis_title="R$",
-        )
+        fig1.update_layout(legend_title_text="", margin=dict(l=10, r=10, t=50, b=10), yaxis_title="R$")
         st.plotly_chart(fig1, config=PLOTLY_CONFIG)
     else:
         st.info("Sem movimentos **realizados** no período para montar o fluxo mensal.")
 
     st.divider()
 
-    # ===========================================
-    # 2) Fluxo de Caixa — Saldo Acumulado (linha)
-    # ===========================================
     st.subheader("Fluxo de Caixa — Saldo Acumulado (Realizado)")
     if not df_real.empty:
         acc = df_real.copy()
         acc["dia"] = pd.to_datetime(acc["data_real"]).dt.date
         acc["var"] = acc.apply(lambda r: r["valor"] if r["tipo"] == "Entrada" else -r["valor"], axis=1)
-
         daily = acc.groupby("dia", as_index=False)["var"].sum().sort_values("dia")
-        # Linha contínua (preenche dias sem movimento)
         idx = pd.date_range(start=dt_ini, end=dt_fim, freq="D")
-        daily = (
-            daily.set_index("dia")
-            .reindex(idx, fill_value=0.0)
-            .rename_axis("dia").reset_index()
-        )
+        daily = (daily.set_index("dia").reindex(idx, fill_value=0.0).rename_axis("dia").reset_index())
         daily["acumulado"] = daily["var"].cumsum()
         daily["dia"] = pd.to_datetime(daily["dia"]).dt.date
-
         fig2 = px.line(
-            daily,
-            x="dia", y="acumulado",
-            markers=True,
+            daily, x="dia", y="acumulado", markers=True,
             title=f"Saldo acumulado (de {dt_ini.strftime('%d/%m/%Y')} até {dt_fim.strftime('%d/%m/%Y')})",
             template="plotly_white",
         )
-        fig2.update_layout(
-            xaxis_title="Data",
-            yaxis_title="R$",
-            margin=dict(l=10, r=10, t=50, b=10),
-        )
+        fig2.update_layout(xaxis_title="Data", yaxis_title="R$", margin=dict(l=10, r=10, t=50, b=10))
         st.plotly_chart(fig2, config={**PLOTLY_CONFIG, "toImageButtonOptions": {"format": "png", "filename": "saldo_acumulado"}})
     else:
         st.info("Sem movimentos **realizados** no período para montar o acumulado.")
 
     st.divider()
 
-    # ============================================================
-    # 3) Previsto vs. Realizado por Centro de Custo (barra agrupada)
-    # ============================================================
     st.subheader("Previsto vs. Realizado por Centro de Custo")
-
     prev_cc = pd.DataFrame(columns=["centro_custo", "previsto"])
     if not df_prev.empty:
         p = df_prev.copy()
         p["centro_custo"] = p["centro_custo"].fillna("(sem CC)")
         prev_cc = p.groupby("centro_custo", as_index=False)["valor"].sum().rename(columns={"valor": "previsto"})
-
     real_cc = pd.DataFrame(columns=["centro_custo", "realizado"])
     if not df_real.empty:
         r = df_real.copy()
         r["centro_custo"] = r["centro_custo"].fillna("(sem CC)")
         real_cc = r.groupby("centro_custo", as_index=False)["valor"].sum().rename(columns={"valor": "realizado"})
-
     comp_cc = pd.merge(prev_cc, real_cc, on="centro_custo", how="outer").fillna(0.0)
     if comp_cc.empty:
         st.info("Sem dados de **previsto/realizado** por Centro de Custo no período.")
     else:
-        comp_cc_long = comp_cc.melt(
-            id_vars="centro_custo",
-            value_vars=["previsto", "realizado"],
-            var_name="Tipo", value_name="Valor",
-        )
+        comp_cc_long = comp_cc.melt(id_vars="centro_custo", value_vars=["previsto", "realizado"], var_name="Tipo", value_name="Valor")
         fig3 = px.bar(
-            comp_cc_long,
-            x="centro_custo", y="Valor",
-            color="Tipo", barmode="group",
+            comp_cc_long, x="centro_custo", y="Valor", color="Tipo", barmode="group",
             title="Previsto vs. Realizado por Centro de Custo (período selecionado)",
             template="plotly_white",
         )
-        fig3.update_layout(
-            xaxis_title="Centro de Custo",
-            yaxis_title="R$",
-            legend_title_text="",
-            margin=dict(l=10, r=10, t=50, b=10),
-        )
+        fig3.update_layout(xaxis_title="Centro de Custo", yaxis_title="R$", legend_title_text="", margin=dict(l=10, r=10, t=50, b=10))
         st.plotly_chart(fig3, config={**PLOTLY_CONFIG, "toImageButtonOptions": {"format": "png", "filename": "previsto_vs_realizado_cc"}})
 
     st.divider()
 
-    # ===========================================
-    # 4) Gastos por Categoria (Saídas — Realizado)
-    # ===========================================
     st.subheader("Gastos por Categoria (Saídas — Realizado)")
     if not df_real.empty:
         saidas = df_real[df_real["tipo"] == "Saida"].copy()
@@ -1474,17 +1367,8 @@ elif page in ("Painéis", "Dashboards"):
             st.info("Não há **saídas realizadas** no período.")
         else:
             gcat = saidas.groupby("categoria", as_index=False)["valor"].sum().sort_values("valor", ascending=False)
-            fig4 = px.bar(
-                gcat,
-                x="categoria", y="valor",
-                title="Total de Saídas por Categoria (Realizado)",
-                template="plotly_white",
-            )
-            fig4.update_layout(
-                xaxis_title="Categoria",
-                yaxis_title="R$",
-                margin=dict(l=10, r=10, t=50, b=10),
-            )
+            fig4 = px.bar(gcat, x="categoria", y="valor", title="Total de Saídas por Categoria (Realizado)", template="plotly_white")
+            fig4.update_layout(xaxis_title="Categoria", yaxis_title="R$", margin=dict(l=10, r=10, t=50, b=10))
             st.plotly_chart(fig4, config={**PLOTLY_CONFIG, "toImageButtonOptions": {"format": "png", "filename": "gastos_por_categoria"}})
     else:
         st.info("Sem movimentos **realizados** para compor *Gastos por Categoria*.")
