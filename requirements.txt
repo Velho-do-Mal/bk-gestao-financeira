@@ -1,0 +1,7 @@
+streamlit==1.37.0
+sqlalchemy==2.0.34
+pandas==2.2.2
+plotly==5.22.0
+python-dateutil==2.9.0.post0
+reportlab==4.2.0
+psycopg[binary]==3.2.10
