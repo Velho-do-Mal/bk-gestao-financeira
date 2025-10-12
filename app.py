@@ -85,7 +85,7 @@ _ensure_sqlite_dir_if_needed(DB_URL)
 connect_args = {"check_same_thread": False} if _is_sqlite(DB_URL) else {}
 pool_kwargs = {}
 if not _is_sqlite(DB_URL):
-    pool_kwargs = dict(pool_size=5, max_overflow=10, pool_pre_ping=True, pool_recycle=1800, pool_reset_on_return='commit')
+    pool_kwargs = dict(pool_size=5, max_overflow=10, pool_pre_ping=True, pool_recycle=1800)
 
 ENGINE = create_engine(DB_URL, echo=False, future=True, connect_args=connect_args, **pool_kwargs)
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, autocommit=False, expire_on_commit=False)
@@ -113,7 +113,7 @@ except Exception as e:
     st.info("""Checklist:
 - O seu requirements.txt tem `psycopg[binary]` (ou `psycopg2-binary`)?
 - A `database_url` no secrets está no formato SQLAlchemy?
-  Exemplo Supabase: postgresql+psycopg://postgres:velhodomal@rniljfoxfjwuhhockbivrniljfoxfjwuhhockbiv.supabase.co:6543/postgres?sslmode=require
+  Exemplo Supabase: postgresql+psycopg://postgres:SENHA@db.<SEU_REF>.supabase.co:5432/postgres?sslmode=require
 - Usuário/senha corretos (Database Password do Supabase)?
 - Salvou os *Secrets* e reiniciou o app?
 """)
