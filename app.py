@@ -65,6 +65,8 @@ def _get_secret(section: str, key: str, default=None):
     except Exception:
         return default
 
+# ... imports e helpers acima ...
+
 DB_URL = os.environ.get("DATABASE_URL") or _get_secret("general", "database_url")
 ATTACH_DIR = os.environ.get("ATTACH_DIR") or _get_secret("general", "attach_dir", "anexos")
 
@@ -78,6 +80,29 @@ if not DB_URL:
 # Pastas
 os.makedirs(ATTACH_DIR, exist_ok=True)
 _ensure_sqlite_dir_if_needed(DB_URL)
+
+# --- FORÇAR IPv4 NA URL DO POSTGRES (evita resolver para IPv6) ---
+def _force_ipv4_in_pg_url(url: str) -> str:
+    try:
+        if not str(url).startswith("postgresql+psycopg://"):
+            return url
+        from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+        import socket
+        u = urlsplit(url)
+        host, port = u.hostname, (u.port or 5432)
+        infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)  # IPv4 only
+        ipv4 = infos[0][4][0] if infos else None
+        if not ipv4:
+            return url
+        q = dict(parse_qsl(u.query, keep_blank_values=True))
+        q["hostaddr"] = ipv4  # psycopg usa este IPv4 direto
+        new_query = urlencode(q)
+        return urlunsplit((u.scheme, u.netloc, u.path, new_query, u.fragment))
+    except Exception:
+        return url
+
+DB_URL = _force_ipv4_in_pg_url(DB_URL)
+# --- fim do patch IPv4 ---
 
 # ===========================
 # Engine e Session (com pool no Postgres)
