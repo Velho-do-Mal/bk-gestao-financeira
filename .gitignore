@@ -1,17 +1,31 @@
-# Arquivo de secrets - NÃO subir credenciais
+# Secrets - NUNCA commitar credenciais
 secrets.toml
 .streamlit/secrets.toml
+.env
 
-# Pasta de anexos e arquivos gerados localmente
+# Anexos/arquivos gerados localmente
 anexos/
+data/
 
-# Cache do Python
-__pycache__/
-
-# Arquivos SQLite
+# Bancos SQLite locais (se algum dia usar)
 *.db
+*.sqlite
+*.sqlite3
 
-# Outros arquivos temporários
+# Cache Python
+__pycache__/
 *.pyc
 *.pyo
+
+# Logs/temporários
 *.log
+
+# Ambientes virtuais (se usar)
+venv/
+.venv/
+env/
+
+# Misc
+.DS_Store
+.ipynb_checkpoints/
+.pytest_cache/
