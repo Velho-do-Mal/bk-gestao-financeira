@@ -1,12 +1,10 @@
 # -*- coding: utf-8 -*-
+from __future__ import annotations
 # BK Engenharia e Tecnologia — App de Gestão Financeira (arquivo único)
 # Python: 3.13 | Streamlit + SQLAlchemy | SQLite/Cloud
 
-from __future__ import annotations
-
 import os, io, re, unicodedata, warnings
 from datetime import date, datetime, timedelta
-from urllib.parse import urlparse, quote, unquote
 from dateutil.relativedelta import relativedelta
 from typing import Optional
 
@@ -15,7 +13,10 @@ import plotly.express as px
 import streamlit as st
 
 # ==== IMPORTS SQLALCHEMY ====
-from sqlalchemy import create_engine, Column, Integer, String, Float, Date, DateTime, Boolean, Text, ForeignKey, func
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Float, Date, DateTime, Boolean, Text,
+    ForeignKey, func
+)
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 
 warnings.filterwarnings("ignore", message="The keyword arguments have been deprecated")
@@ -24,7 +25,7 @@ warnings.filterwarnings("ignore", message="The keyword arguments have been depre
 # Configurações Gerais
 # ===========================
 APP_TITLE = "BK Gestão Financeira"
-APP_VERSION = "v1.9.1"
+APP_VERSION = "v1.9.2"
 
 st.set_page_config(page_title=APP_TITLE, page_icon="💼", layout="wide", initial_sidebar_state="expanded")
 
@@ -89,6 +90,34 @@ if not _is_sqlite(DB_URL):
 ENGINE = create_engine(DB_URL, echo=False, future=True, connect_args=connect_args, **pool_kwargs)
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, autocommit=False, expire_on_commit=False)
 Base = declarative_base()
+
+# DEBUG: ver driver/dialeto e URL (com senha mascarada)
+try:
+    from urllib.parse import urlsplit, urlunsplit
+    st.caption(f"Dialeto do banco de dados: {ENGINE.dialect.name} | Driver: {ENGINE.dialect.driver}")
+    _raw = os.environ.get("DATABASE_URL") or _get_secret("general", "database_url")
+    if _raw:
+        u = urlsplit(_raw)
+        netloc = f"{u.username or ''}:{'***' if u.password else ''}@{u.hostname or ''}:{u.port or ''}"
+        st.code(urlunsplit((u.scheme, netloc, u.path, u.query, u.fragment)), language="text")
+except Exception as _e:
+    st.warning(f"Debug falhou: {type(_e).__name__}: {_e}")
+
+# Teste de conexão explícito (antes de criar tabelas)
+try:
+    with ENGINE.connect() as conn:
+        conn.exec_driver_sql("select 1")
+except Exception as e:
+    st.error("❌ Não consegui conectar ao banco de dados (verifique secrets.toml).")
+    st.code(str(e), language="text")
+    st.info("""Checklist:
+- O seu requirements.txt tem `psycopg[binary]` (ou `psycopg2-binary`)?
+- A `database_url` no secrets está no formato SQLAlchemy?
+  Exemplo Supabase: postgresql+psycopg://postgres:SENHA@db.<SEU_REF>.supabase.co:5432/postgres?sslmode=require
+- Usuário/senha corretos (Database Password do Supabase)?
+- Salvou os *Secrets* e reiniciou o app?
+""")
+    st.stop()
 
 # ===========================
 # Models
@@ -182,6 +211,7 @@ class Transferencia(Base):
     descricao = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+# criar tabelas (agora que os models existem)
 Base.metadata.create_all(bind=ENGINE)
 
 # ===========================
@@ -312,6 +342,7 @@ def df_query_cached(sql: str) -> pd.DataFrame:
 def success(msg: str): st.toast(msg, icon="✅")
 def error(msg: str): st.toast(msg, icon="❌")
 
+# garantir dados mínimos
 ensure_seed_data()
 
 with st.sidebar:
@@ -319,7 +350,6 @@ with st.sidebar:
     st.caption(APP_VERSION)
     page = st.radio("Navegação", ["Home","Cadastro","Metas","Movimentações","Relatórios","Dashboards"], index=0, key="nav_page")
     st.divider()
-    # (ocultado DB_URL para não vazar)
 
 st.markdown("""
 <style>
@@ -359,16 +389,21 @@ if page == "Home":
 
     st.subheader("Saldos por Banco")
     dfb = compute_bank_balances()
-    if dfb.empty: st.info("Cadastre bancos em **Cadastro > Bancos**.")
+    if dfb.empty:
+        st.info("Cadastre bancos em **Cadastro > Bancos**.")
     else:
-        st.dataframe(dfb[["nome","saldo_atual"]].rename(columns={"nome":"Banco","saldo_atual":"Saldo Atual"}), use_container_width=True)
+        st.dataframe(
+            dfb[["nome","saldo_atual"]].rename(columns={"nome":"Banco","saldo_atual":"Saldo Atual"}),
+            use_container_width=True
+        )
 
     st.subheader("Próximos 30 dias — Fluxo Previsto")
     with get_session() as s:
         hoje = date.today(); fim = hoje + timedelta(days=30)
         q = s.query(Transacao).filter(Transacao.data_prevista>=hoje, Transacao.data_prevista<=fim).order_by(Transacao.data_prevista)
         df = pd.read_sql(q.statement, s.bind)
-    if df.empty: st.info("Sem lançamentos previstos para os próximos 30 dias.")
+    if df.empty:
+        st.info("Sem lançamentos previstos para os próximos 30 dias.")
     else:
         st.dataframe(df[["id","tipo","valor","data_prevista","foi_pago","data_real","descricao"]], use_container_width=True)
 
@@ -405,7 +440,8 @@ if page == "Home":
             WHERE t.foi_pago=0 AND DATE(t.data_prevista) < CURRENT_DATE
             ORDER BY t.data_prevista ASC
         """)
-    if atrasados.empty: st.success("Não há lançamentos em atraso. 🎉")
+    if atrasados.empty:
+        st.success("Não há lançamentos em atraso. 🎉")
     else:
         cE, cS = st.columns(2)
         ent = atrasados[atrasados["tipo"]=="Entrada"].copy()
@@ -499,7 +535,7 @@ elif page == "Cadastro":
                         obj = load_obj(s, Fornecedor, edit_id)
                         if obj:
                             with st.form("form_forn_edit"):
-                                c1,c2,c3,c4 = st.columns(4)
+                                c1, c2, c3, c4 = st.columns(4)
                                 nome = c1.text_input("Nome", obj.nome, key="forn_edit_nome")
                                 doc = c2.text_input("Documento", obj.documento or "", key="forn_edit_doc")
                                 email = c3.text_input("E-mail", obj.email or "", key="forn_edit_email")
@@ -522,7 +558,7 @@ elif page == "Cadastro":
     with tabs[2]:
         st.subheader("Bancos — Incluir")
         with st.form("form_banco_add", clear_on_submit=True):
-            c1,c2 = st.columns(2)
+            c1, c2 = st.columns(2)
             nome = c1.text_input("Nome do banco", key="bco_add_nome")
             saldo = c2.number_input("Saldo inicial", min_value=0.0, step=100.0, format="%.2f", key="bco_add_saldo")
             if st.form_submit_button("Adicionar Banco") and nome:
@@ -544,7 +580,7 @@ elif page == "Cadastro":
                         obj = load_obj(s, Banco, edit_id)
                         if obj:
                             with st.form("form_banco_edit"):
-                                c1,c2 = st.columns(2)
+                                c1, c2 = st.columns(2)
                                 nome = c1.text_input("Nome", obj.nome, key="bco_edit_nome")
                                 saldo = c2.number_input("Saldo inicial", min_value=0.0, step=100.0, format="%.2f", value=float(obj.saldo_inicial or 0), key="bco_edit_saldo")
                                 if st.form_submit_button("Salvar alterações"):
@@ -564,22 +600,18 @@ elif page == "Cadastro":
     # ---------- Categorias ----------
     with tabs[3]:
         st.subheader("Categorias — Incluir")
-        # >>> Tipo FORA do form para reagir imediatamente <<<
-        cat_add_tipo = st.selectbox("Tipo (para a nova categoria)", ["Entrada","Saida"], key="cat_add_tipo_live")
-
+        cat_add_tipo = st.selectbox("Tipo (para a nova categoria)", ["Entrada", "Saida"], key="cat_add_tipo_live")
         with get_session() as s:
             nomes_exist = pd.read_sql(
                 "SELECT DISTINCT nome FROM categorias WHERE tipo=:t ORDER BY nome",
                 s.bind, params={"t": cat_add_tipo}
             )
         sugestoes = nomes_exist["nome"].tolist() if not nomes_exist.empty else []
-
         with st.form("form_cat_add", clear_on_submit=True):
-            c1,c2 = st.columns(2)
+            c1, c2 = st.columns(2)
             c1.markdown(f"**Tipo selecionado:** `{cat_add_tipo}`")
             nome_sel = c2.selectbox("Nome da categoria", options=(["- digite novo -"] + sugestoes), key="cat_add_nome_sel")
             nome_txt = c2.text_input("Novo nome", key="cat_add_nome_txt") if nome_sel == "- digite novo -" else nome_sel
-
             if st.form_submit_button("Adicionar Categoria"):
                 nome_final = (nome_txt or "").strip()
                 if not nome_final:
@@ -588,10 +620,8 @@ elif page == "Cadastro":
                     with get_session() as s:
                         s.add(Categoria(tipo=cat_add_tipo, nome=nome_final))
                         _done(s, "Categoria cadastrada.")
-
         df_c = df_query_cached("SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome")
         st.dataframe(df_c, use_container_width=True)
-
         colE, colD = st.columns(2)
         with colE:
             st.markdown("**Editar Categoria**")
@@ -603,8 +633,8 @@ elif page == "Cadastro":
                         obj = load_obj(s, Categoria, edit_id)
                         if obj:
                             with st.form("form_cat_edit"):
-                                c1,c2 = st.columns(2)
-                                tipo = c1.selectbox("Tipo", ["Entrada","Saida"], index=0 if obj.tipo=="Entrada" else 1, key="cat_edit_tipo")
+                                c1, c2 = st.columns(2)
+                                tipo = c1.selectbox("Tipo", ["Entrada", "Saida"], index=0 if obj.tipo == "Entrada" else 1, key="cat_edit_tipo")
                                 nomes_exist = pd.read_sql("SELECT DISTINCT nome FROM categorias WHERE tipo=:t ORDER BY nome", s.bind, params={"t": tipo})
                                 sugestoes = nomes_exist["nome"].tolist() if not nomes_exist.empty else []
                                 cur = obj.nome if obj.nome not in sugestoes else None
@@ -633,55 +663,43 @@ elif page == "Cadastro":
     # ---------- Subcategorias ----------
     with tabs[4]:
         st.subheader("Subcategorias — Incluir")
-        # >>> Tipo FORA do form para reagir imediatamente <<<
         sub_add_tipo = st.selectbox("Tipo (para a nova subcategoria)", ["Entrada", "Saida"], key="sub_add_tipo_live")
-
         with get_session() as s:
             cats = pd.read_sql("SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome", s.bind)
         cats_tipo = cats[cats["tipo"] == sub_add_tipo]
-
-        cat_opts_add = [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _,r in cats_tipo.iterrows()]
-        # Garantia de lista não vazia para UX
+        cat_opts_add = [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _, r in cats_tipo.iterrows()]
         if not cat_opts_add:
             st.info("Cadastre uma categoria do tipo selecionado primeiro.")
         else:
-            # carregar sugestões para a primeira cat por padrão
             default_cat_id = extract_id(cat_opts_add[0])
-
             with get_session() as s:
                 nomes_exist = pd.read_sql(
                     "SELECT DISTINCT nome FROM subcategorias WHERE categoria_id=:c ORDER BY nome",
                     s.bind, params={"c": default_cat_id}
                 )
             sugestoes_default = nomes_exist["nome"].tolist() if not nomes_exist.empty else []
-
             with st.form("form_sub_add", clear_on_submit=True):
-                c1,c2 = st.columns(2)
+                c1, c2 = st.columns(2)
                 cat_opt = c1.selectbox("Categoria", cat_opts_add, key="sub_add_cat")
-                # recomputa sugestões conforme a categoria escolhida (dentro do form, usamos o valor atual)
                 with get_session() as s:
                     nomes_exist2 = pd.read_sql(
                         "SELECT DISTINCT nome FROM subcategorias WHERE categoria_id=:c ORDER BY nome",
                         s.bind, params={"c": extract_id(cat_opt)}
                     )
                 sugestoes = nomes_exist2["nome"].tolist() if not nomes_exist2.empty else sugestoes_default
-
                 nome_sel = c2.selectbox("Nome da subcategoria", ["- digite novo -"] + sugestoes, key="sub_add_nome_sel")
                 nome = c2.text_input("Novo nome", key="sub_add_nome_txt") if nome_sel == "- digite novo -" else nome_sel
-
                 if st.form_submit_button("Adicionar Subcategoria") and (nome or "").strip():
                     cat_id = extract_id(cat_opt)
                     with get_session() as s:
                         s.add(Subcategoria(categoria_id=cat_id, nome=(nome or "").strip()))
                         _done(s, "Subcategoria cadastrada.")
-
         df_sc = df_query_cached("""
             SELECT s.id, c.tipo, c.nome AS categoria, s.nome AS subcategoria
             FROM subcategorias s JOIN categorias c ON c.id=s.categoria_id
             ORDER BY c.tipo, c.nome, s.nome
         """)
         st.dataframe(df_sc, use_container_width=True)
-
         colE, colD = st.columns(2)
         with colE:
             st.markdown("**Editar Subcategoria**")
@@ -694,18 +712,18 @@ elif page == "Cadastro":
                         cats = pd.read_sql("SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome", s.bind)
                         if obj:
                             with st.form("form_sub_edit"):
-                                c1,c2 = st.columns(2)
-                                tipo_sel = c1.selectbox("Tipo", ["Entrada","Saida"], index=0 if s.get(Categoria, obj.categoria_id).tipo=="Entrada" else 1, key="sub_edit_tipo")
+                                c1, c2 = st.columns(2)
+                                tipo_sel = c1.selectbox("Tipo", ["Entrada", "Saida"], index=0 if s.get(Categoria, obj.categoria_id).tipo == "Entrada" else 1, key="sub_edit_tipo")
                                 cats_tipo = cats[cats["tipo"] == tipo_sel]
                                 cat_obj = s.get(Categoria, obj.categoria_id)
                                 cat_label_cur = f"{cat_obj.tipo} - {cat_obj.nome} (# {cat_obj.id})" if cat_obj else "-"
-                                opts = [cat_label_cur] + [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _,r in cats_tipo.iterrows() if f"{r['tipo']} - {r['nome']} (# {r['id']})" != cat_label_cur]
+                                opts = [cat_label_cur] + [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _, r in cats_tipo.iterrows() if f"{r['tipo']} - {r['nome']} (# {r['id']})" != cat_label_cur]
                                 escolha = c1.selectbox("Categoria", opts, key="sub_edit_cat")
                                 new_cat_id = extract_id(escolha) or obj.categoria_id
                                 nomes_exist = pd.read_sql("SELECT DISTINCT nome FROM subcategorias WHERE categoria_id=:c ORDER BY nome", s.bind, params={"c": new_cat_id})
                                 sugestoes = nomes_exist["nome"].tolist() if not nomes_exist.empty else []
                                 nome_sel = c2.selectbox("Nome", (sugestoes + ["- digite novo -"]), index=(sugestoes.index(obj.nome) if obj.nome in sugestoes else len(sugestoes)), key="sub_edit_nome_sel")
-                                nome = c2.text_input("Novo nome", value=(obj.nome if nome_sel=="- digite novo -" else ""), key="sub_edit_nome_txt") if nome_sel=="- digite novo -" else nome_sel
+                                nome = c2.text_input("Novo nome", value=(obj.nome if nome_sel == "- digite novo -" else ""), key="sub_edit_nome_txt") if nome_sel == "- digite novo -" else nome_sel
                                 if st.form_submit_button("Salvar alterações"):
                                     obj.categoria_id = new_cat_id
                                     obj.nome = (nome or "").strip()
@@ -725,7 +743,7 @@ elif page == "Cadastro":
     with tabs[5]:
         st.subheader("Centros de Custo — Incluir")
         with st.form("form_cc_add", clear_on_submit=True):
-            c1,c2 = st.columns(2)
+            c1, c2 = st.columns(2)
             nome = c1.text_input("Nome do centro de custo", key="cc_add_nome")
             desc = c2.text_input("Descrição", key="cc_add_desc")
             if st.form_submit_button("Adicionar Centro de Custo") and nome:
@@ -747,7 +765,7 @@ elif page == "Cadastro":
                         obj = load_obj(s, CentroCusto, edit_id)
                         if obj:
                             with st.form("form_cc_edit"):
-                                c1,c2 = st.columns(2)
+                                c1, c2 = st.columns(2)
                                 nome = c1.text_input("Nome", obj.nome, key="cc_edit_nome")
                                 desc = c2.text_input("Descrição", obj.descricao or "", key="cc_edit_desc")
                                 if st.form_submit_button("Salvar alterações"):
@@ -775,24 +793,23 @@ elif page == "Metas":
     colf = st.columns(4)
     ano = colf[0].number_input("Ano", min_value=2000, max_value=2100, value=date.today().year, key="meta_ano")
     mes = colf[1].number_input("Mês", min_value=1, max_value=12, value=date.today().month, key="meta_mes")
-    cat_opt = colf[2].selectbox("Categoria", ["-"] + [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _,r in cats.iterrows()], key="meta_cat")
+    cat_opt = colf[2].selectbox("Categoria", ["-"] + [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _, r in cats.iterrows()], key="meta_cat")
     valor_prev = colf[3].number_input("Valor Previsto (R$)", min_value=0.0, step=100.0, format="%.2f", key="meta_valor_prev")
     if cat_opt == "-":
         st.info("Selecione uma categoria para lançar metas.")
     else:
         cat_id = extract_id(cat_opt)
-        subs_cat = subs[subs["categoria_id"]==cat_id]
-        sub_opt = st.selectbox("Subcategoria", ["-"] + [f"{r['nome']} (# {r['id']})" for _,r in subs_cat.iterrows()], key="meta_sub")
+        subs_cat = subs[subs["categoria_id"] == cat_id]
+        sub_opt = st.selectbox("Subcategoria", ["-"] + [f"{r['nome']} (# {r['id']})" for _, r in subs_cat.iterrows()], key="meta_sub")
         if st.button("Salvar Meta", key="meta_save"):
             with get_session() as s:
                 s.add(Meta(
                     ano=int(ano), mes=int(mes),
                     categoria_id=cat_id,
-                    subcategoria_id=extract_id(sub_opt) if sub_opt!="-" else None,
+                    subcategoria_id=extract_id(sub_opt) if sub_opt != "-" else None,
                     valor_previsto=float(valor_prev),
                 ))
                 _done(s, "Meta salva.")
-
     st.subheader("Metas do mês")
     with get_session() as s:
         dfm = pd.read_sql("""
@@ -804,7 +821,6 @@ elif page == "Metas":
             ORDER BY c.tipo, categoria, subcategoria
         """, s.bind, params={"ano": int(ano), "mes": int(mes)})
     st.dataframe(dfm, use_container_width=True)
-
     colE, colD = st.columns(2)
     with colE:
         st.markdown("**Editar Meta**")
@@ -816,14 +832,14 @@ elif page == "Metas":
                     obj = load_obj(s, Meta, edit_id)
                     if obj:
                         with st.form("form_meta_edit"):
-                            c1,c2,c3 = st.columns(3)
+                            c1, c2, c3 = st.columns(3)
                             ano_n = c1.number_input("Ano", 2000, 2100, value=int(obj.ano), key="meta_edit_ano")
                             mes_n = c2.number_input("Mês", 1, 12, value=int(obj.mes), key="meta_edit_mes")
                             valor = c3.number_input("Valor Previsto", min_value=0.0, step=100.0, format="%.2f", value=float(obj.valor_previsto or 0), key="meta_edit_valor")
                             cats = pd.read_sql("SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome", s.bind)
                             cat_obj = s.get(Categoria, obj.categoria_id)
                             cat_label = f"{cat_obj.tipo} - {cat_obj.nome} (# {obj.categoria_id})" if cat_obj else "-"
-                            categoria = st.selectbox("Categoria", [cat_label] + [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _,r in cats.iterrows()], key="meta_edit_cat")
+                            categoria = st.selectbox("Categoria", [cat_label] + [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _, r in cats.iterrows()], key="meta_edit_cat")
                             sub_opt_list = pd.read_sql(
                                 "SELECT id, nome FROM subcategorias WHERE categoria_id = :c",
                                 s.bind, params={"c": (extract_id(categoria) or obj.categoria_id)},
@@ -832,7 +848,7 @@ elif page == "Metas":
                             if obj.subcategoria_id:
                                 sc = s.get(Subcategoria, obj.subcategoria_id)
                                 if sc: sub_label = f"{sc.nome} (# {sc.id})"
-                            subcat = st.selectbox("Subcategoria", ["-"] + ([sub_label] if sub_label else []) + [f"{r['nome']} (# {r['id']})" for _,r in sub_opt_list.iterrows()], key="meta_edit_sub")
+                            subcat = st.selectbox("Subcategoria", ["-"] + ([sub_label] if sub_label else []) + [f"{r['nome']} (# {r['id']})" for _, r in sub_opt_list.iterrows()], key="meta_edit_sub")
                             if st.form_submit_button("Salvar alterações"):
                                 obj.ano, obj.mes = int(ano_n), int(mes_n)
                                 obj.categoria_id = extract_id(categoria) or obj.categoria_id
@@ -859,7 +875,6 @@ elif page == "Movimentações":
 
     # --------- Lançamentos (ADD) ---------
     with tabs[0]:
-        # DADOS AUXILIARES
         with get_session() as s:
             df_cat_all = pd.read_sql("SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome", s.bind)
             df_sub_all = pd.read_sql("SELECT id, categoria_id, nome FROM subcategorias ORDER BY nome", s.bind)
@@ -869,34 +884,21 @@ elif page == "Movimentações":
             df_bco_all = pd.read_sql("SELECT id, nome FROM bancos ORDER BY nome", s.bind)
 
         st.subheader("Incluir Lançamento")
-
-        # >>> Tipo FORA do form para reagir imediatamente <<<
         tipo_add = st.selectbox("Tipo do lançamento", ["Entrada", "Saida"], key="tx_add_tipo_live")
-
-        # As opções dependem do tipo acima
         cat_rows = df_cat_all[df_cat_all["tipo"] == tipo_add]
         cat_opts = [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _, r in cat_rows.iterrows()]
-
-        # Para subcategoria, usamos a primeira categoria como default visual até o usuário escolher outra
         default_cat_id = extract_id(cat_opts[0]) if cat_opts else None
         sub_rows_default = df_sub_all[df_sub_all["categoria_id"] == (default_cat_id or -1)]
         sub_opts_default = ["-"] + [f"{r['nome']} (# {r['id']})" for _, r in sub_rows_default.iterrows()]
 
         with st.form("form_tx_add", clear_on_submit=True):
             c1, c2, c3, c4 = st.columns(4)
-
-            # Dentro do form, usuário escolhe a categoria entre as do tipo atual
             cat_add  = c2.selectbox("Categoria", cat_opts, placeholder="Selecione", key="tx_add_cat")
             cat_id_add = extract_id(cat_add) if cat_add else default_cat_id
-
-            # Subcategorias vinculadas à categoria escolhida
             sub_rows = df_sub_all[df_sub_all["categoria_id"] == (cat_id_add or -1)]
             sub_opts = ["-"] + [f"{r['nome']} (# {r['id']})" for _, r in sub_rows.iterrows()]
             sub_add  = c3.selectbox("Subcategoria", sub_opts if sub_opts else sub_opts_default, key="tx_add_sub")
-
             valor_add = c4.number_input("Valor (R$)", min_value=0.0, step=100.0, format="%.2f", key="tx_add_valor")
-
-            # Como o tipo já está fora, só exibimos
             c1.markdown(f"**Tipo selecionado:** `{tipo_add}`")
 
             d1, d2, d3, d4 = st.columns(4)
@@ -928,7 +930,6 @@ elif page == "Movimentações":
             if st.form_submit_button("Lançar"):
                 if not cat_id_add:
                     error("Selecione a categoria."); st.stop()
-
                 with get_session() as s:
                     def add_tx(idx: Optional[int], dt: date):
                         t = Transacao(
@@ -962,7 +963,6 @@ elif page == "Movimentações":
                         for i in range(1, total + 1):
                             dt = data_prev_add + (relativedelta(months=i - 1) if periodicidade_add == "Mensal" else relativedelta(years=i - 1))
                             add_tx(i, dt)
-
                     _done(s, "Movimentação(ões) lançada(s).")
 
         # Lista + Editar/Excluir
@@ -987,7 +987,6 @@ elif page == "Movimentações":
         st.dataframe(df_tx, use_container_width=True)
 
         colE, colD = st.columns(2)
-
         # Editar
         with colE:
             st.markdown("**Editar Lançamento**")
@@ -1002,11 +1001,9 @@ elif page == "Movimentações":
                             with st.form("form_tx_edit"):
                                 c1, c2, c3, c4 = st.columns(4)
                                 tipo_ed = c1.selectbox("Tipo", ["Entrada", "Saida"], index=0 if t.tipo == "Entrada" else 1, key="tx_edit_tipo")
-
                                 df_cat_typ = pd.read_sql(
                                     "SELECT id, tipo, nome FROM categorias WHERE tipo=:tp ORDER BY nome",
-                                    s.bind,
-                                    params={"tp": tipo_ed},
+                                    s.bind, params={"tp": tipo_ed},
                                 )
                                 cat_cur = s.get(Categoria, t.categoria_id)
                                 cat_label_cur = f"{cat_cur.tipo} - {cat_cur.nome} (# {cat_cur.id})" if cat_cur else "-"
@@ -1016,14 +1013,12 @@ elif page == "Movimentações":
                                 cat_id_sel = extract_id(cat_ed) or t.categoria_id
                                 df_sub_typ = pd.read_sql(
                                     "SELECT id, nome FROM subcategorias WHERE categoria_id=:c ORDER BY nome",
-                                    s.bind,
-                                    params={"c": cat_id_sel},
+                                    s.bind, params={"c": cat_id_sel},
                                 )
                                 sub_label_cur = "-"
                                 if t.subcategoria_id:
                                     sc = s.get(Subcategoria, t.subcategoria_id)
-                                    if sc:
-                                        sub_label_cur = f"{sc.nome} (# {sc.id})"
+                                    if sc: sub_label_cur = f"{sc.nome} (# {sc.id})"
                                 sub_opts_ed = ["-"] + ([sub_label_cur] if sub_label_cur != "-" else []) + [f"{r['nome']} (# {r['id']})" for _, r in df_sub_typ.iterrows() if f"{r['nome']} (# {r['id']})" != sub_label_cur]
                                 sub_ed = c3.selectbox("Subcategoria", sub_opts_ed, key="tx_edit_sub")
 
@@ -1038,8 +1033,7 @@ elif page == "Movimentações":
                                 bco_label_cur = "-"
                                 if t.banco_id:
                                     bco_cur = s.get(Banco, t.banco_id)
-                                    if bco_cur:
-                                        bco_label_cur = f"{bco_cur.nome} (# {bco_cur.id})"
+                                    if bco_cur: bco_label_cur = f"{bco_cur.nome} (# {bco_cur.id})"
                                 bco_opts_ed = [bco_label_cur] + [f"{r['nome']} (# {r['id']})" for _, r in df_bco.iterrows() if f"{r['nome']} (# {r['id']})" != bco_label_cur]
                                 bco_ed = d4.selectbox("Banco", bco_opts_ed, key="tx_edit_banco")
 
@@ -1048,8 +1042,7 @@ elif page == "Movimentações":
                                 cc_label_cur = "-"
                                 if t.centro_custo_id:
                                     cc_cur = s.get(CentroCusto, t.centro_custo_id)
-                                    if cc_cur:
-                                        cc_label_cur = f"{cc_cur.nome} (# {cc_cur.id})"
+                                    if cc_cur: cc_label_cur = f"{cc_cur.nome} (# {cc_cur.id})"
                                 cc_opts_ed = [cc_label_cur] + [f"{r['nome']} (# {r['id']})" for _, r in df_cc.iterrows() if f"{r['nome']} (# {r['id']})" != cc_label_cur]
                                 cc_ed = e1.selectbox("Centro de Custo", cc_opts_ed, key="tx_edit_cc")
 
@@ -1057,8 +1050,7 @@ elif page == "Movimentações":
                                 cli_label_cur = "-"
                                 if t.cliente_id:
                                     cli_cur = s.get(Cliente, t.cliente_id)
-                                    if cli_cur:
-                                        cli_label_cur = f"{cli_cur.nome} (# {cli_cur.id})"
+                                    if cli_cur: cli_label_cur = f"{cli_cur.nome} (# {cli_cur.id})"
                                 cli_opts_ed = [cli_label_cur] + [f"{r['nome']} (# {r['id']})" for _, r in df_cli.iterrows() if f"{r['nome']} (# {r['id']})" != cli_label_cur]
                                 cli_ed = e2.selectbox("Cliente (Entrada)", cli_opts_ed, key="tx_edit_cli")
 
@@ -1066,8 +1058,7 @@ elif page == "Movimentações":
                                 forn_label_cur = "-"
                                 if t.fornecedor_id:
                                     f_cur = s.get(Fornecedor, t.fornecedor_id)
-                                    if f_cur:
-                                        forn_label_cur = f"{f_cur.nome} (# {f_cur.id})"
+                                    if f_cur: forn_label_cur = f"{f_cur.nome} (# {f_cur.id})"
                                 forn_opts_ed = [forn_label_cur] + [f"{r['nome']} (# {r['id']})" for _, r in df_forn.iterrows() if f"{r['nome']} (# {r['id']})" != forn_label_cur]
                                 forn_ed = e3.selectbox("Fornecedor (Saída)", forn_opts_ed, key="tx_edit_forn")
 
