@@ -102,6 +102,8 @@ def _force_ipv4_in_pg_url(url: str) -> str:
         return url
 
 DB_URL = _force_ipv4_in_pg_url(DB_URL)
+st.caption(f"URL final usada pelo engine (com hostaddr IPv4): {DB_URL}")
+
 # --- fim do patch IPv4 ---
 
 # ===========================
