@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
+
 from __future__ import annotations
+
 # BK Engenharia e Tecnologia — App de Gestão Financeira (arquivo único)
 # Python: 3.13 | Streamlit + SQLAlchemy | SQLite/Cloud
 
@@ -15,7 +17,7 @@ import streamlit as st
 # ==== IMPORTS SQLALCHEMY ====
 from sqlalchemy import (
     create_engine, Column, Integer, String, Float, Date, DateTime, Boolean, Text,
-    ForeignKey, func
+    ForeignKey, func, text   # <- text para binds
 )
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 
@@ -25,7 +27,7 @@ warnings.filterwarnings("ignore", message="The keyword arguments have been depre
 # Configurações Gerais
 # ===========================
 APP_TITLE = "BK Gestão Financeira"
-APP_VERSION = "v1.9.2"
+APP_VERSION = "v1.9.3"
 
 st.set_page_config(page_title=APP_TITLE, page_icon="💼", layout="wide", initial_sidebar_state="expanded")
 
@@ -40,11 +42,16 @@ def _ensure_sqlite_dir_if_needed(url: str) -> None:
     if not _is_sqlite(url):
         return
     path = url.replace("sqlite:///", "", 1)
+    # Corrige caso Streamlit entregue '/C:/...' no Windows
     if path.startswith("/") and len(path) > 2 and path[2] == ":":
         path = path[1:]
     folder = os.path.dirname(path)
     if folder and not os.path.exists(folder):
         os.makedirs(folder, exist_ok=True)
+
+def sql_bool(v: bool) -> str:
+    """Retorna como representar booleano em SQL para o dialeto atual."""
+    return ("1" if v else "0") if _is_sqlite(DB_URL) else ("TRUE" if v else "FALSE")
 
 def _sanitize_filename(name: str) -> str:
     name = os.path.basename(name)
@@ -65,8 +72,7 @@ def _get_secret(section: str, key: str, default=None):
     except Exception:
         return default
 
-# ... imports e helpers acima ...
-
+# --- Leitura da config
 DB_URL = os.environ.get("DATABASE_URL") or _get_secret("general", "database_url")
 ATTACH_DIR = os.environ.get("ATTACH_DIR") or _get_secret("general", "attach_dir", "anexos")
 
@@ -81,9 +87,15 @@ if not DB_URL:
 os.makedirs(ATTACH_DIR, exist_ok=True)
 _ensure_sqlite_dir_if_needed(DB_URL)
 
+# --- helpers de boolean em SQL cru (SQLite vs Postgres)
+SQL_TRUE  = "1" if _is_sqlite(DB_URL) else "TRUE"
+SQL_FALSE = "0" if _is_sqlite(DB_URL) else "FALSE"
+# --- fim helpers
+
 # --- FORÇAR IPv4 NA URL DO POSTGRES (evita resolver para IPv6) ---
 def _force_ipv4_in_pg_url(url: str) -> str:
     try:
+        # Suporta psycopg v3 (driver "psycopg")
         if not str(url).startswith("postgresql+psycopg://"):
             return url
         from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
@@ -102,9 +114,6 @@ def _force_ipv4_in_pg_url(url: str) -> str:
         return url
 
 DB_URL = _force_ipv4_in_pg_url(DB_URL)
-st.caption(f"URL final usada pelo engine (com hostaddr IPv4): {DB_URL}")
-
-# --- fim do patch IPv4 ---
 
 # ===========================
 # Engine e Session (com pool no Postgres)
@@ -118,17 +127,20 @@ ENGINE = create_engine(DB_URL, echo=False, future=True, connect_args=connect_arg
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, autocommit=False, expire_on_commit=False)
 Base = declarative_base()
 
-# DEBUG: ver driver/dialeto e URL (com senha mascarada)
-try:
-    from urllib.parse import urlsplit, urlunsplit
-    st.caption(f"Dialeto do banco de dados: {ENGINE.dialect.name} | Driver: {ENGINE.dialect.driver}")
-    _raw = os.environ.get("DATABASE_URL") or _get_secret("general", "database_url")
-    if _raw:
-        u = urlsplit(_raw)
+# DEBUG (opcional, sem vazar senha)
+with st.sidebar:
+    st.divider()
+    _dbg = st.checkbox("Modo debug", value=False)
+if _dbg:
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+        u = urlsplit(DB_URL)
+        # Mascara a senha
         netloc = f"{u.username or ''}:{'***' if u.password else ''}@{u.hostname or ''}:{u.port or ''}"
+        st.caption(f"Dialeto: {ENGINE.dialect.name} • Driver: {ENGINE.dialect.driver}")
         st.code(urlunsplit((u.scheme, netloc, u.path, u.query, u.fragment)), language="text")
-except Exception as _e:
-    st.warning(f"Debug falhou: {type(_e).__name__}: {_e}")
+    except Exception as _e:
+        st.warning(f"Debug falhou: {type(_e).__name__}: {_e}")
 
 # Teste de conexão explícito (antes de criar tabelas)
 try:
@@ -138,6 +150,7 @@ except Exception as e:
     st.error("❌ Não consegui conectar ao banco de dados (verifique secrets.toml).")
     st.code(str(e), language="text")
     st.info("""Checklist:
+
 - O seu requirements.txt tem `psycopg[binary]` (ou `psycopg2-binary`)?
 - A `database_url` no secrets está no formato SQLAlchemy?
   Exemplo Supabase: postgresql+psycopg://postgres:SENHA@db.<SEU_REF>.supabase.co:5432/postgres?sslmode=require
@@ -248,8 +261,17 @@ def get_session():
     return SessionLocal()
 
 def df_query(sql: str, params: dict|None=None) -> pd.DataFrame:
+    """Leitura padrão. Usa text(sql) quando há params para habilitar binds."""
     with ENGINE.connect() as conn:
-        return pd.read_sql(sql, conn, params=params or {})
+        if params:
+            return pd.read_sql(text(sql), conn, params=params)
+        return pd.read_sql(sql, conn)
+
+def pd_read_sql(bind, sql: str, params: dict|None=None) -> pd.DataFrame:
+    """Helper para usar em sessões .bind com/sem params."""
+    if params:
+        return pd.read_sql(text(sql), bind, params=params)
+    return pd.read_sql(sql, bind)
 
 def money(v: float) -> str:
     try:
@@ -282,27 +304,27 @@ def _done(session, msg: str):
 
 def compute_bank_balances() -> pd.DataFrame:
     with get_session() as s:
-        bancos = pd.read_sql("SELECT id, nome, saldo_inicial FROM bancos ORDER BY nome", s.bind)
+        bancos = pd_read_sql(s.bind, "SELECT id, nome, saldo_inicial FROM bancos ORDER BY nome")
         if bancos.empty:
             return pd.DataFrame(columns=["banco_id", "nome", "saldo_atual"])
-        ent = pd.read_sql("""
+        ent = pd_read_sql(s.bind, f"""
             SELECT banco_id, COALESCE(SUM(valor),0) AS total
-            FROM transacoes WHERE foi_pago=1 AND tipo='Entrada' AND banco_id IS NOT NULL
+            FROM transacoes WHERE foi_pago={sql_bool(True)} AND tipo='Entrada' AND banco_id IS NOT NULL
             GROUP BY banco_id
-        """, s.bind)
-        sai = pd.read_sql("""
+        """)
+        sai = pd_read_sql(s.bind, f"""
             SELECT banco_id, COALESCE(SUM(valor),0) AS total
-            FROM transacoes WHERE foi_pago=1 AND tipo='Saida' AND banco_id IS NOT NULL
+            FROM transacoes WHERE foi_pago={sql_bool(True)} AND tipo='Saida' AND banco_id IS NOT NULL
             GROUP BY banco_id
-        """, s.bind)
-        tin = pd.read_sql("""
+        """)
+        tin = pd_read_sql(s.bind, f"""
             SELECT banco_destino_id AS banco_id, COALESCE(SUM(valor),0) AS total
-            FROM transferencias WHERE foi_executada=1 GROUP BY banco_destino_id
-        """, s.bind)
-        tout = pd.read_sql("""
+            FROM transferencias WHERE foi_executada={sql_bool(True)} GROUP BY banco_destino_id
+        """)
+        tout = pd_read_sql(s.bind, f"""
             SELECT banco_origem_id AS banco_id, COALESCE(SUM(valor),0) AS total
-            FROM transferencias WHERE foi_executada=1 GROUP BY banco_origem_id
-        """, s.bind)
+            FROM transferencias WHERE foi_executada={sql_bool(True)} GROUP BY banco_origem_id
+        """)
 
         def get_total(df, bank_id):
             if df.empty: return 0.0
@@ -421,7 +443,7 @@ if page == "Home":
     else:
         st.dataframe(
             dfb[["nome","saldo_atual"]].rename(columns={"nome":"Banco","saldo_atual":"Saldo Atual"}),
-            use_container_width=True
+            width="stretch"
         )
 
     st.subheader("Próximos 30 dias — Fluxo Previsto")
@@ -432,7 +454,7 @@ if page == "Home":
     if df.empty:
         st.info("Sem lançamentos previstos para os próximos 30 dias.")
     else:
-        st.dataframe(df[["id","tipo","valor","data_prevista","foi_pago","data_real","descricao"]], use_container_width=True)
+        st.dataframe(df[["id","tipo","valor","data_prevista","foi_pago","data_real","descricao"]], width="stretch")
 
     st.subheader("Atrasados — Entradas/Saídas não pagas")
     if _is_sqlite(DB_URL):
@@ -452,7 +474,7 @@ if page == "Home":
             ORDER BY t.data_prevista ASC
         """)
     else:
-        atrasados = df_query("""
+        atrasados = df_query(f"""
             SELECT t.id, t.tipo, c.nome AS categoria, s2.nome AS subcategoria, t.valor,
                    t.data_prevista, cc.nome AS centro_custo,
                    cli.nome AS cliente, f.nome AS fornecedor, b.nome AS banco, t.descricao,
@@ -464,7 +486,7 @@ if page == "Home":
             LEFT JOIN clientes cli ON cli.id=t.cliente_id
             LEFT JOIN fornecedores f ON f.id=t.fornecedor_id
             LEFT JOIN bancos b ON b.id=t.banco_id
-            WHERE t.foi_pago=0 AND DATE(t.data_prevista) < CURRENT_DATE
+            WHERE t.foi_pago={SQL_FALSE} AND DATE(t.data_prevista) < CURRENT_DATE
             ORDER BY t.data_prevista ASC
         """)
     if atrasados.empty:
@@ -475,11 +497,11 @@ if page == "Home":
         sai = atrasados[atrasados["tipo"]=="Saida"].copy()
         with cE:
             st.caption("Entradas em atraso")
-            st.dataframe(ent[["id","categoria","subcategoria","cliente","valor","data_prevista","dias_atraso","descricao"]], use_container_width=True)
+            st.dataframe(ent[["id","categoria","subcategoria","cliente","valor","data_prevista","dias_atraso","descricao"]], width="stretch")
             st.metric("Total", money(ent["valor"].sum()))
         with cS:
             st.caption("Saídas em atraso")
-            st.dataframe(sai[["id","categoria","subcategoria","fornecedor","valor","data_prevista","dias_atraso","descricao"]], use_container_width=True)
+            st.dataframe(sai[["id","categoria","subcategoria","fornecedor","valor","data_prevista","dias_atraso","descricao"]], width="stretch")
             st.metric("Total", money(sai["valor"].sum()))
 
 # ===========================
@@ -505,7 +527,7 @@ elif page == "Cadastro":
                         s.add(Cliente(nome=nome, documento=doc, email=email, telefone=tel))
                         _done(s, "Cliente cadastrado.")
         df_cli = df_query_cached("SELECT id, nome, documento, email, telefone, created_at FROM clientes ORDER BY id DESC")
-        st.dataframe(df_cli, use_container_width=True)
+        st.dataframe(df_cli, width="stretch")
         colE, colD = st.columns(2)
         with colE:
             st.markdown("**Editar Cliente**")
@@ -550,7 +572,7 @@ elif page == "Cadastro":
                         s.add(Fornecedor(nome=nome, documento=doc, email=email, telefone=tel))
                         _done(s, "Fornecedor cadastrado.")
         df_f = df_query_cached("SELECT id, nome, documento, email, telefone, created_at FROM fornecedores ORDER BY id DESC")
-        st.dataframe(df_f, use_container_width=True)
+        st.dataframe(df_f, width="stretch")
         colE, colD = st.columns(2)
         with colE:
             st.markdown("**Editar Fornecedor**")
@@ -595,7 +617,7 @@ elif page == "Cadastro":
                         s.add(Banco(nome=nome, saldo_inicial=float(saldo)))
                         _done(s, "Banco cadastrado.")
         df_b = df_query_cached("SELECT id, nome, saldo_inicial, created_at FROM bancos ORDER BY id DESC")
-        st.dataframe(df_b, use_container_width=True)
+        st.dataframe(df_b, width="stretch")
         colE, colD = st.columns(2)
         with colE:
             st.markdown("**Editar Banco**")
@@ -629,9 +651,10 @@ elif page == "Cadastro":
         st.subheader("Categorias — Incluir")
         cat_add_tipo = st.selectbox("Tipo (para a nova categoria)", ["Entrada", "Saida"], key="cat_add_tipo_live")
         with get_session() as s:
-            nomes_exist = pd.read_sql(
+            nomes_exist = pd_read_sql(
+                s.bind,
                 "SELECT DISTINCT nome FROM categorias WHERE tipo=:t ORDER BY nome",
-                s.bind, params={"t": cat_add_tipo}
+                params={"t": cat_add_tipo}
             )
         sugestoes = nomes_exist["nome"].tolist() if not nomes_exist.empty else []
         with st.form("form_cat_add", clear_on_submit=True):
@@ -648,7 +671,7 @@ elif page == "Cadastro":
                         s.add(Categoria(tipo=cat_add_tipo, nome=nome_final))
                         _done(s, "Categoria cadastrada.")
         df_c = df_query_cached("SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome")
-        st.dataframe(df_c, use_container_width=True)
+        st.dataframe(df_c, width="stretch")
         colE, colD = st.columns(2)
         with colE:
             st.markdown("**Editar Categoria**")
@@ -662,7 +685,7 @@ elif page == "Cadastro":
                             with st.form("form_cat_edit"):
                                 c1, c2 = st.columns(2)
                                 tipo = c1.selectbox("Tipo", ["Entrada", "Saida"], index=0 if obj.tipo == "Entrada" else 1, key="cat_edit_tipo")
-                                nomes_exist = pd.read_sql("SELECT DISTINCT nome FROM categorias WHERE tipo=:t ORDER BY nome", s.bind, params={"t": tipo})
+                                nomes_exist = pd_read_sql(s.bind, "SELECT DISTINCT nome FROM categorias WHERE tipo=:t ORDER BY nome", params={"t": tipo})
                                 sugestoes = nomes_exist["nome"].tolist() if not nomes_exist.empty else []
                                 cur = obj.nome if obj.nome not in sugestoes else None
                                 nome = c2.selectbox(
@@ -692,7 +715,7 @@ elif page == "Cadastro":
         st.subheader("Subcategorias — Incluir")
         sub_add_tipo = st.selectbox("Tipo (para a nova subcategoria)", ["Entrada", "Saida"], key="sub_add_tipo_live")
         with get_session() as s:
-            cats = pd.read_sql("SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome", s.bind)
+            cats = pd_read_sql(s.bind, "SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome")
         cats_tipo = cats[cats["tipo"] == sub_add_tipo]
         cat_opts_add = [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _, r in cats_tipo.iterrows()]
         if not cat_opts_add:
@@ -700,18 +723,20 @@ elif page == "Cadastro":
         else:
             default_cat_id = extract_id(cat_opts_add[0])
             with get_session() as s:
-                nomes_exist = pd.read_sql(
+                nomes_exist = pd_read_sql(
+                    s.bind,
                     "SELECT DISTINCT nome FROM subcategorias WHERE categoria_id=:c ORDER BY nome",
-                    s.bind, params={"c": default_cat_id}
+                    params={"c": default_cat_id}
                 )
             sugestoes_default = nomes_exist["nome"].tolist() if not nomes_exist.empty else []
             with st.form("form_sub_add", clear_on_submit=True):
                 c1, c2 = st.columns(2)
                 cat_opt = c1.selectbox("Categoria", cat_opts_add, key="sub_add_cat")
                 with get_session() as s:
-                    nomes_exist2 = pd.read_sql(
+                    nomes_exist2 = pd_read_sql(
+                        s.bind,
                         "SELECT DISTINCT nome FROM subcategorias WHERE categoria_id=:c ORDER BY nome",
-                        s.bind, params={"c": extract_id(cat_opt)}
+                        params={"c": extract_id(cat_opt)}
                     )
                 sugestoes = nomes_exist2["nome"].tolist() if not nomes_exist2.empty else sugestoes_default
                 nome_sel = c2.selectbox("Nome da subcategoria", ["- digite novo -"] + sugestoes, key="sub_add_nome_sel")
@@ -726,7 +751,7 @@ elif page == "Cadastro":
             FROM subcategorias s JOIN categorias c ON c.id=s.categoria_id
             ORDER BY c.tipo, c.nome, s.nome
         """)
-        st.dataframe(df_sc, use_container_width=True)
+        st.dataframe(df_sc, width="stretch")
         colE, colD = st.columns(2)
         with colE:
             st.markdown("**Editar Subcategoria**")
@@ -736,7 +761,7 @@ elif page == "Cadastro":
                 if edit_id:
                     with get_session() as s:
                         obj = load_obj(s, Subcategoria, edit_id)
-                        cats = pd.read_sql("SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome", s.bind)
+                        cats = pd_read_sql(s.bind, "SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome")
                         if obj:
                             with st.form("form_sub_edit"):
                                 c1, c2 = st.columns(2)
@@ -747,7 +772,7 @@ elif page == "Cadastro":
                                 opts = [cat_label_cur] + [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _, r in cats_tipo.iterrows() if f"{r['tipo']} - {r['nome']} (# {r['id']})" != cat_label_cur]
                                 escolha = c1.selectbox("Categoria", opts, key="sub_edit_cat")
                                 new_cat_id = extract_id(escolha) or obj.categoria_id
-                                nomes_exist = pd.read_sql("SELECT DISTINCT nome FROM subcategorias WHERE categoria_id=:c ORDER BY nome", s.bind, params={"c": new_cat_id})
+                                nomes_exist = pd_read_sql(s.bind, "SELECT DISTINCT nome FROM subcategorias WHERE categoria_id=:c ORDER BY nome", params={"c": new_cat_id})
                                 sugestoes = nomes_exist["nome"].tolist() if not nomes_exist.empty else []
                                 nome_sel = c2.selectbox("Nome", (sugestoes + ["- digite novo -"]), index=(sugestoes.index(obj.nome) if obj.nome in sugestoes else len(sugestoes)), key="sub_edit_nome_sel")
                                 nome = c2.text_input("Novo nome", value=(obj.nome if nome_sel == "- digite novo -" else ""), key="sub_edit_nome_txt") if nome_sel == "- digite novo -" else nome_sel
@@ -780,7 +805,7 @@ elif page == "Cadastro":
                         s.add(CentroCusto(nome=nome, descricao=desc))
                         _done(s, "Centro de custo cadastrado.")
         df_cc = df_query_cached("SELECT id, nome, descricao FROM centros_custo ORDER BY nome")
-        st.dataframe(df_cc, use_container_width=True)
+        st.dataframe(df_cc, width="stretch")
         colE, colD = st.columns(2)
         with colE:
             st.markdown("**Editar Centro de Custo**")
@@ -815,8 +840,8 @@ elif page == "Cadastro":
 elif page == "Metas":
     st.header("Metas (Previsões)")
     with get_session() as s:
-        cats = pd.read_sql("SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome", s.bind)
-        subs = pd.read_sql("SELECT id, categoria_id, nome FROM subcategorias", s.bind)
+        cats = pd_read_sql(s.bind, "SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome")
+        subs = pd_read_sql(s.bind, "SELECT id, categoria_id, nome FROM subcategorias")
     colf = st.columns(4)
     ano = colf[0].number_input("Ano", min_value=2000, max_value=2100, value=date.today().year, key="meta_ano")
     mes = colf[1].number_input("Mês", min_value=1, max_value=12, value=date.today().month, key="meta_mes")
@@ -839,15 +864,15 @@ elif page == "Metas":
                 _done(s, "Meta salva.")
     st.subheader("Metas do mês")
     with get_session() as s:
-        dfm = pd.read_sql("""
+        dfm = pd_read_sql(s.bind, """
             SELECT m.id, m.ano, m.mes, c.tipo, c.nome as categoria, s2.nome as subcategoria, m.valor_previsto
             FROM metas m
             JOIN categorias c ON c.id=m.categoria_id
             LEFT JOIN subcategorias s2 ON s2.id=m.subcategoria_id
             WHERE m.ano=:ano AND m.mes=:mes
             ORDER BY c.tipo, categoria, subcategoria
-        """, s.bind, params={"ano": int(ano), "mes": int(mes)})
-    st.dataframe(dfm, use_container_width=True)
+        """, params={"ano": int(ano), "mes": int(mes)})
+    st.dataframe(dfm, width="stretch")
     colE, colD = st.columns(2)
     with colE:
         st.markdown("**Editar Meta**")
@@ -863,13 +888,13 @@ elif page == "Metas":
                             ano_n = c1.number_input("Ano", 2000, 2100, value=int(obj.ano), key="meta_edit_ano")
                             mes_n = c2.number_input("Mês", 1, 12, value=int(obj.mes), key="meta_edit_mes")
                             valor = c3.number_input("Valor Previsto", min_value=0.0, step=100.0, format="%.2f", value=float(obj.valor_previsto or 0), key="meta_edit_valor")
-                            cats = pd.read_sql("SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome", s.bind)
+                            cats = pd_read_sql(s.bind, "SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome")
                             cat_obj = s.get(Categoria, obj.categoria_id)
                             cat_label = f"{cat_obj.tipo} - {cat_obj.nome} (# {obj.categoria_id})" if cat_obj else "-"
                             categoria = st.selectbox("Categoria", [cat_label] + [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _, r in cats.iterrows()], key="meta_edit_cat")
-                            sub_opt_list = pd.read_sql(
-                                "SELECT id, nome FROM subcategorias WHERE categoria_id = :c",
-                                s.bind, params={"c": (extract_id(categoria) or obj.categoria_id)},
+                            sub_opt_list = pd_read_sql(
+                                s.bind, "SELECT id, nome FROM subcategorias WHERE categoria_id = :c",
+                                params={"c": (extract_id(categoria) or obj.categoria_id)},
                             )
                             sub_label = ""
                             if obj.subcategoria_id:
@@ -903,12 +928,12 @@ elif page == "Movimentações":
     # --------- Lançamentos (ADD) ---------
     with tabs[0]:
         with get_session() as s:
-            df_cat_all = pd.read_sql("SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome", s.bind)
-            df_sub_all = pd.read_sql("SELECT id, categoria_id, nome FROM subcategorias ORDER BY nome", s.bind)
-            df_cc_all  = pd.read_sql("SELECT id, nome FROM centros_custo ORDER BY nome", s.bind)
-            df_cli_all = pd.read_sql("SELECT id, nome FROM clientes ORDER BY nome", s.bind)
-            df_forn_all= pd.read_sql("SELECT id, nome FROM fornecedores ORDER BY nome", s.bind)
-            df_bco_all = pd.read_sql("SELECT id, nome FROM bancos ORDER BY nome", s.bind)
+            df_cat_all = pd_read_sql(s.bind, "SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome")
+            df_sub_all = pd_read_sql(s.bind, "SELECT id, categoria_id, nome FROM subcategorias ORDER BY nome")
+            df_cc_all  = pd_read_sql(s.bind, "SELECT id, nome FROM centros_custo ORDER BY nome")
+            df_cli_all = pd_read_sql(s.bind, "SELECT id, nome FROM clientes ORDER BY nome")
+            df_forn_all= pd_read_sql(s.bind, "SELECT id, nome FROM fornecedores ORDER BY nome")
+            df_bco_all = pd_read_sql(s.bind, "SELECT id, nome FROM bancos ORDER BY nome")
 
         st.subheader("Incluir Lançamento")
         tipo_add = st.selectbox("Tipo do lançamento", ["Entrada", "Saida"], key="tx_add_tipo_live")
@@ -995,8 +1020,7 @@ elif page == "Movimentações":
         # Lista + Editar/Excluir
         st.subheader("Lançamentos — Lista")
         with get_session() as s:
-            df_tx = pd.read_sql(
-                """
+            df_tx = pd_read_sql(s.bind, """
                 SELECT t.id, t.tipo, c.nome AS categoria, s2.nome AS subcategoria, t.valor,
                        t.data_prevista, t.foi_pago, t.data_real,
                        cc.nome AS centro_custo, cli.nome AS cliente, f.nome AS fornecedor, b.nome AS banco, t.descricao
@@ -1008,10 +1032,8 @@ elif page == "Movimentações":
                 LEFT JOIN fornecedores f ON f.id = t.fornecedor_id
                 LEFT JOIN bancos b ON b.id = t.banco_id
                 ORDER BY t.data_prevista DESC, t.id DESC
-                """,
-                s.bind,
-            )
-        st.dataframe(df_tx, use_container_width=True)
+            """)
+        st.dataframe(df_tx, width="stretch")
 
         colE, colD = st.columns(2)
         # Editar
@@ -1028,9 +1050,9 @@ elif page == "Movimentações":
                             with st.form("form_tx_edit"):
                                 c1, c2, c3, c4 = st.columns(4)
                                 tipo_ed = c1.selectbox("Tipo", ["Entrada", "Saida"], index=0 if t.tipo == "Entrada" else 1, key="tx_edit_tipo")
-                                df_cat_typ = pd.read_sql(
-                                    "SELECT id, tipo, nome FROM categorias WHERE tipo=:tp ORDER BY nome",
-                                    s.bind, params={"tp": tipo_ed},
+                                df_cat_typ = pd_read_sql(
+                                    s.bind, "SELECT id, tipo, nome FROM categorias WHERE tipo=:tp ORDER BY nome",
+                                    params={"tp": tipo_ed},
                                 )
                                 cat_cur = s.get(Categoria, t.categoria_id)
                                 cat_label_cur = f"{cat_cur.tipo} - {cat_cur.nome} (# {cat_cur.id})" if cat_cur else "-"
@@ -1038,9 +1060,9 @@ elif page == "Movimentações":
                                 cat_ed = c2.selectbox("Categoria", cat_opts_ed, key="tx_edit_cat")
 
                                 cat_id_sel = extract_id(cat_ed) or t.categoria_id
-                                df_sub_typ = pd.read_sql(
-                                    "SELECT id, nome FROM subcategorias WHERE categoria_id=:c ORDER BY nome",
-                                    s.bind, params={"c": cat_id_sel},
+                                df_sub_typ = pd_read_sql(
+                                    s.bind, "SELECT id, nome FROM subcategorias WHERE categoria_id=:c ORDER BY nome",
+                                    params={"c": cat_id_sel},
                                 )
                                 sub_label_cur = "-"
                                 if t.subcategoria_id:
@@ -1056,7 +1078,7 @@ elif page == "Movimentações":
                                 pago_ed      = d2.checkbox("Pago?", value=bool(t.foi_pago), key="tx_edit_pago")
                                 data_real_ed = d3.date_input("Data Real", value=t.data_real or date.today(), key="tx_edit_data_real") if pago_ed else None
 
-                                df_bco = pd.read_sql("SELECT id, nome FROM bancos ORDER BY nome", s.bind)
+                                df_bco = pd_read_sql(s.bind, "SELECT id, nome FROM bancos ORDER BY nome")
                                 bco_label_cur = "-"
                                 if t.banco_id:
                                     bco_cur = s.get(Banco, t.banco_id)
@@ -1065,7 +1087,7 @@ elif page == "Movimentações":
                                 bco_ed = d4.selectbox("Banco", bco_opts_ed, key="tx_edit_banco")
 
                                 e1, e2, e3 = st.columns(3)
-                                df_cc = pd.read_sql("SELECT id, nome FROM centros_custo ORDER BY nome", s.bind)
+                                df_cc = pd_read_sql(s.bind, "SELECT id, nome FROM centros_custo ORDER BY nome")
                                 cc_label_cur = "-"
                                 if t.centro_custo_id:
                                     cc_cur = s.get(CentroCusto, t.centro_custo_id)
@@ -1073,7 +1095,7 @@ elif page == "Movimentações":
                                 cc_opts_ed = [cc_label_cur] + [f"{r['nome']} (# {r['id']})" for _, r in df_cc.iterrows() if f"{r['nome']} (# {r['id']})" != cc_label_cur]
                                 cc_ed = e1.selectbox("Centro de Custo", cc_opts_ed, key="tx_edit_cc")
 
-                                df_cli = pd.read_sql("SELECT id, nome FROM clientes ORDER BY nome", s.bind)
+                                df_cli = pd_read_sql(s.bind, "SELECT id, nome FROM clientes ORDER BY nome")
                                 cli_label_cur = "-"
                                 if t.cliente_id:
                                     cli_cur = s.get(Cliente, t.cliente_id)
@@ -1081,7 +1103,7 @@ elif page == "Movimentações":
                                 cli_opts_ed = [cli_label_cur] + [f"{r['nome']} (# {r['id']})" for _, r in df_cli.iterrows() if f"{r['nome']} (# {r['id']})" != cli_label_cur]
                                 cli_ed = e2.selectbox("Cliente (Entrada)", cli_opts_ed, key="tx_edit_cli")
 
-                                df_forn = pd.read_sql("SELECT id, nome FROM fornecedores ORDER BY nome", s.bind)
+                                df_forn = pd_read_sql(s.bind, "SELECT id, nome FROM fornecedores ORDER BY nome")
                                 forn_label_cur = "-"
                                 if t.fornecedor_id:
                                     f_cur = s.get(Fornecedor, t.fornecedor_id)
@@ -1163,7 +1185,7 @@ elif page == "Movimentações":
     with tabs[1]:
         st.caption("Transferências movem saldos entre bancos (não afetam resultado).")
         with get_session() as s:
-            df_bancos = pd.read_sql("SELECT id, nome FROM bancos ORDER BY nome", s.bind)
+            df_bancos = pd_read_sql(s.bind, "SELECT id, nome FROM bancos ORDER BY nome")
 
         st.subheader("Incluir Transferência")
         with st.form("form_trf_add", clear_on_submit=True):
@@ -1186,18 +1208,15 @@ elif page == "Movimentações":
 
         st.subheader("Lista de Transferências")
         with get_session() as s:
-            dft = pd.read_sql(
-                """
+            dft = pd_read_sql(s.bind, """
                 SELECT t.id, b1.nome AS origem, b2.nome AS destino, t.valor, t.data_prevista,
                        t.foi_executada, t.data_real, t.descricao
                 FROM transferencias t
                 JOIN bancos b1 ON b1.id = t.banco_origem_id
                 JOIN bancos b2 ON b2.id = t.banco_destino_id
                 ORDER BY t.data_prevista DESC, t.id DESC
-                """,
-                s.bind,
-            )
-        st.dataframe(dft, use_container_width=True)
+            """)
+        st.dataframe(dft, width="stretch")
 
         exec_id = input_id_to_edit_delete(dft, "ID para executar/desfazer", key="trf_exec_id") if not dft.empty else None
         colx1, colx2 = st.columns(2)
@@ -1232,7 +1251,7 @@ elif page == "Movimentações":
                 if edit_id:
                     with get_session() as s:
                         tr = load_obj(s, Transferencia, edit_id)
-                        df_bancos = pd.read_sql("SELECT id, nome FROM bancos ORDER BY nome", s.bind)
+                        df_bancos = pd_read_sql(s.bind, "SELECT id, nome FROM bancos ORDER BY nome")
                         if tr:
                             with st.form("form_trf_edit"):
                                 c1, c2, c3, c4 = st.columns(4)
@@ -1281,7 +1300,8 @@ elif page == "Relatórios":
         tipo_sql = "AND t.tipo='Saida'"
 
     with get_session() as s:
-        df_rel = pd.read_sql(
+        df_rel = pd_read_sql(
+            s.bind,
             f"""
             SELECT t.id, t.tipo, c.nome AS categoria, s2.nome AS subcategoria, t.valor,
                    t.data_prevista, t.foi_pago, t.data_real, b.nome AS banco, t.descricao
@@ -1293,11 +1313,10 @@ elif page == "Relatórios":
             {tipo_sql}
             ORDER BY t.data_prevista ASC, t.id ASC
             """,
-            s.bind,
             params={"d1": dt_ini.isoformat(), "d2": dt_fim.isoformat()},
         )
 
-    st.dataframe(df_rel, use_container_width=True)
+    st.dataframe(df_rel, width="stretch")
     colT1, colT2, colT3 = st.columns(3)
     tot_e = df_rel.loc[df_rel["tipo"] == "Entrada", "valor"].sum()
     tot_s = df_rel.loc[df_rel["tipo"] == "Saida", "valor"].sum()
@@ -1332,31 +1351,34 @@ elif page in ("Painéis", "Dashboards"):
         dt_ini, dt_fim = dt_fim, dt_ini
 
     with get_session() as s:
-        df_real = pd.read_sql(
-            """
+        df_real = pd_read_sql(
+            s.bind,
+            f"""
             SELECT t.id, t.tipo, t.valor,
-                   t.data_prevista, t.foi_pago, t.data_real,
-                   c.nome AS categoria, cc.nome AS centro_custo
+                t.data_prevista, t.foi_pago, t.data_real,
+                c.nome AS categoria, cc.nome AS centro_custo
             FROM transacoes t
             JOIN categorias c ON c.id = t.categoria_id
             LEFT JOIN centros_custo cc ON cc.id = t.centro_custo_id
-            WHERE t.foi_pago = 1
-              AND DATE(t.data_real) BETWEEN :ini AND :fim
+            WHERE t.foi_pago = {sql_bool(True)}
+            AND DATE(t.data_real) BETWEEN :ini AND :fim
             """,
-            s.bind, params={"ini": dt_ini.isoformat(), "fim": dt_fim.isoformat()}
+            params={"ini": dt_ini.isoformat(), "fim": dt_fim.isoformat()}
         )
-        df_prev = pd.read_sql(
-            """
+
+        df_prev = pd_read_sql(
+            s.bind,
+            f"""
             SELECT t.id, t.tipo, t.valor,
-                   t.data_prevista, t.foi_pago, t.data_real,
-                   c.nome AS categoria, cc.nome AS centro_custo
+                t.data_prevista, t.foi_pago, t.data_real,
+                c.nome AS categoria, cc.nome AS centro_custo
             FROM transacoes t
             JOIN categorias c ON c.id = t.categoria_id
             LEFT JOIN centros_custo cc ON cc.id = t.centro_custo_id
-            WHERE t.foi_pago = 0
-              AND DATE(t.data_prevista) BETWEEN :ini AND :fim
+            WHERE t.foi_pago = {sql_bool(False)}
+            AND DATE(t.data_prevista) BETWEEN :ini AND :fim
             """,
-            s.bind, params={"ini": dt_ini.isoformat(), "fim": dt_fim.isoformat()}
+            params={"ini": dt_ini.isoformat(), "fim": dt_fim.isoformat()}
         )
 
     st.divider()
@@ -1380,7 +1402,7 @@ elif page in ("Painéis", "Dashboards"):
             template="plotly_white",
         )
         fig1.update_layout(legend_title_text="", margin=dict(l=10, r=10, t=50, b=10), yaxis_title="R$")
-        st.plotly_chart(fig1, config=PLOTLY_CONFIG)
+        st.plotly_chart(fig1, config={**PLOTLY_CONFIG})
     else:
         st.info("Sem movimentos **realizados** no período para montar o fluxo mensal.")
 
