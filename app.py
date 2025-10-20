@@ -174,7 +174,7 @@ except Exception as e:
 
 - O seu requirements.txt tem `psycopg[binary]` (ou `psycopg2-binary`)?
 - A `database_url` no secrets está no formato SQLAlchemy?
-  Exemplo Supabase: postgresql+psycopg://postgres:SENHA@db.<SEU_REF>.supabase.co:5432/postgres?sslmode=require
+  Exemplo Supabase: postgresql+psycopg://postgres:BKengMNKeng@db.rniljfoxfjwuhhockbiv.supabase.co:5432/postgres?sslmode=require
 - Usuário/senha corretos (Database Password do Supabase)?
 - Salvou os *Secrets* e reiniciou o app?
 """)
