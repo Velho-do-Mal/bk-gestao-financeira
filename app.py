@@ -1437,36 +1437,36 @@ elif page in ("Painéis", "Dashboards"):
         st.warning("Período inválido (início > fim). Ajustei automaticamente.")
         dt_ini, dt_fim = dt_fim, dt_ini
 
-   # --- consultas (use sempre pd.read_sql(sql, con, params=...) ---
+    # --- consultas (use sempre pd.read_sql(sql, con, params=...) ---
     with get_session() as s:
         df_real = pd.read_sql(
-            text("""
+            text(f"""
             SELECT t.id, t.tipo, t.valor,
                 t.data_prevista, t.foi_pago, t.data_real,
                 c.nome AS categoria, cc.nome AS centro_custo
             FROM transacoes t
             JOIN categorias c ON c.id = t.categoria_id
             LEFT JOIN centros_custo cc ON cc.id = t.centro_custo_id
-            WHERE t.foi_pago = TRUE
-            AND t.data_real BETWEEN :ini::date AND :fim::date
+            WHERE t.foi_pago = {sql_bool(True)}
+            AND t.data_real::date BETWEEN :ini AND :fim
             """),
             s.bind,
-            params={"ini": dt_ini.isoformat(), "fim": dt_fim.isoformat()}
+            params={"ini": dt_ini.isoformat(), "fim": dt_fim.isoformat()},
         )
 
         df_prev = pd.read_sql(
-            text("""
+            text(f"""
             SELECT t.id, t.tipo, t.valor,
                 t.data_prevista, t.foi_pago, t.data_real,
                 c.nome AS categoria, cc.nome AS centro_custo
             FROM transacoes t
             JOIN categorias c ON c.id = t.categoria_id
             LEFT JOIN centros_custo cc ON cc.id = t.centro_custo_id
-            WHERE t.foi_pago = FALSE
-            AND t.data_prevista BETWEEN :ini::date AND :fim::date
+            WHERE t.foi_pago = {sql_bool(False)}
+            AND t.data_prevista::date BETWEEN :ini AND :fim
             """),
             s.bind,
-            params={"ini": dt_ini.isoformat(), "fim": dt_fim.isoformat()}
+            params={"ini": dt_ini.isoformat(), "fim": dt_fim.isoformat()},
         )
 
     st.divider()
