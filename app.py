@@ -391,15 +391,18 @@ def df_query_cached(sql: str) -> pd.DataFrame:
 def success(msg: str): st.toast(msg, icon="✅")
 def error(msg: str): st.toast(msg, icon="❌")
 
-# garantir dados mínimos
+# garantir dados mínimos ALTEREI E VER SER SE OK
 ensure_seed_data()
 
 with st.sidebar:
     st.title("💼 BK Gestão Financeira")
     st.caption(APP_VERSION)
-    page = st.radio("Navegação", ["Home","Cadastro","Metas","Movimentações","Relatórios","Dashboards"], index=0, key="nav_page")
-    st.divider()
+    PAGE_ID = page.lower().replace(" ", "_")
 
+    def k(s: str) -> str:
+        """Gera uma chave estável por página para widgets/plots."""
+        return f"{PAGE_ID}:{s}"
+#### FIM DA ALTERAÇÃO
 st.markdown("""
 <style>
 .stButton>button {border-radius: 12px; padding: .6rem 1rem;}
@@ -443,7 +446,8 @@ if page == "Home":
     else:
         st.dataframe(
             dfb[["nome","saldo_atual"]].rename(columns={"nome":"Banco","saldo_atual":"Saldo Atual"}),
-            width="stretch"
+            use_container_width=True,
+            key=k("home_dfb")
         )
 
     st.subheader("Próximos 30 dias — Fluxo Previsto")
@@ -454,7 +458,8 @@ if page == "Home":
     if df.empty:
         st.info("Sem lançamentos previstos para os próximos 30 dias.")
     else:
-        st.dataframe(df[["id","tipo","valor","data_prevista","foi_pago","data_real","descricao"]], width="stretch")
+        st.dataframe(df[["id","tipo","valor","data_prevista","foi_pago","data_real","descricao"]],
+             use_container_width=True, key=k("home_prox30"))
 
     st.subheader("Atrasados — Entradas/Saídas não pagas")
     if _is_sqlite(DB_URL):
@@ -497,12 +502,12 @@ if page == "Home":
         sai = atrasados[atrasados["tipo"]=="Saida"].copy()
         with cE:
             st.caption("Entradas em atraso")
-            st.dataframe(ent[["id","categoria","subcategoria","cliente","valor","data_prevista","dias_atraso","descricao"]], width="stretch")
-            st.metric("Total", money(ent["valor"].sum()))
+            st.dataframe(ent[["id","categoria","subcategoria","cliente","valor","data_prevista","dias_atraso","descricao"]],
+                 use_container_width=True, key=k("home_atrasados_ent"))
         with cS:
             st.caption("Saídas em atraso")
-            st.dataframe(sai[["id","categoria","subcategoria","fornecedor","valor","data_prevista","dias_atraso","descricao"]], width="stretch")
-            st.metric("Total", money(sai["valor"].sum()))
+            st.dataframe(sai[["id","categoria","subcategoria","fornecedor","valor","data_prevista","dias_atraso","descricao"]],
+                 use_container_width=True, key=k("home_atrasados_sai"))
 
 # ===========================
 # Cadastro
@@ -527,7 +532,7 @@ elif page == "Cadastro":
                         s.add(Cliente(nome=nome, documento=doc, email=email, telefone=tel))
                         _done(s, "Cliente cadastrado.")
         df_cli = df_query_cached("SELECT id, nome, documento, email, telefone, created_at FROM clientes ORDER BY id DESC")
-        st.dataframe(df_cli, width="stretch")
+        st.dataframe(df_cli, use_container_width=True)
         colE, colD = st.columns(2)
         with colE:
             st.markdown("**Editar Cliente**")
@@ -572,7 +577,7 @@ elif page == "Cadastro":
                         s.add(Fornecedor(nome=nome, documento=doc, email=email, telefone=tel))
                         _done(s, "Fornecedor cadastrado.")
         df_f = df_query_cached("SELECT id, nome, documento, email, telefone, created_at FROM fornecedores ORDER BY id DESC")
-        st.dataframe(df_f, width="stretch")
+        st.dataframe(df_f, use_container_width=True)
         colE, colD = st.columns(2)
         with colE:
             st.markdown("**Editar Fornecedor**")
@@ -617,7 +622,7 @@ elif page == "Cadastro":
                         s.add(Banco(nome=nome, saldo_inicial=float(saldo)))
                         _done(s, "Banco cadastrado.")
         df_b = df_query_cached("SELECT id, nome, saldo_inicial, created_at FROM bancos ORDER BY id DESC")
-        st.dataframe(df_b, width="stretch")
+        st.dataframe(df_b, use_container_width=True)
         colE, colD = st.columns(2)
         with colE:
             st.markdown("**Editar Banco**")
@@ -671,7 +676,7 @@ elif page == "Cadastro":
                         s.add(Categoria(tipo=cat_add_tipo, nome=nome_final))
                         _done(s, "Categoria cadastrada.")
         df_c = df_query_cached("SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome")
-        st.dataframe(df_c, width="stretch")
+        st.dataframe(df_c, use_container_width=True)
         colE, colD = st.columns(2)
         with colE:
             st.markdown("**Editar Categoria**")
@@ -751,7 +756,7 @@ elif page == "Cadastro":
             FROM subcategorias s JOIN categorias c ON c.id=s.categoria_id
             ORDER BY c.tipo, c.nome, s.nome
         """)
-        st.dataframe(df_sc, width="stretch")
+        st.dataframe(df_sc, use_container_width=True)
         colE, colD = st.columns(2)
         with colE:
             st.markdown("**Editar Subcategoria**")
@@ -805,7 +810,7 @@ elif page == "Cadastro":
                         s.add(CentroCusto(nome=nome, descricao=desc))
                         _done(s, "Centro de custo cadastrado.")
         df_cc = df_query_cached("SELECT id, nome, descricao FROM centros_custo ORDER BY nome")
-        st.dataframe(df_cc, width="stretch")
+        st.dataframe(df_cc, use_container_width=True)
         colE, colD = st.columns(2)
         with colE:
             st.markdown("**Editar Centro de Custo**")
@@ -872,7 +877,7 @@ elif page == "Metas":
             WHERE m.ano=:ano AND m.mes=:mes
             ORDER BY c.tipo, categoria, subcategoria
         """, params={"ano": int(ano), "mes": int(mes)})
-    st.dataframe(dfm, width="stretch")
+    st.dataframe(dfm, use_container_width=True)
     colE, colD = st.columns(2)
     with colE:
         st.markdown("**Editar Meta**")
@@ -1033,7 +1038,7 @@ elif page == "Movimentações":
                 LEFT JOIN bancos b ON b.id = t.banco_id
                 ORDER BY t.data_prevista DESC, t.id DESC
             """)
-        st.dataframe(df_tx, width="stretch")
+        st.dataframe(df_tx, use_container_width=True)
 
         colE, colD = st.columns(2)
         # Editar
@@ -1216,7 +1221,7 @@ elif page == "Movimentações":
                 JOIN bancos b2 ON b2.id = t.banco_destino_id
                 ORDER BY t.data_prevista DESC, t.id DESC
             """)
-        st.dataframe(dft, width="stretch")
+        st.dataframe(dft, use_container_width=True)
 
         exec_id = input_id_to_edit_delete(dft, "ID para executar/desfazer", key="trf_exec_id") if not dft.empty else None
         colx1, colx2 = st.columns(2)
@@ -1316,7 +1321,7 @@ elif page == "Relatórios":
             params={"d1": dt_ini.isoformat(), "d2": dt_fim.isoformat()},
         )
 
-    st.dataframe(df_rel, width="stretch")
+    st.dataframe(df_rel, use_container_width=True)
     colT1, colT2, colT3 = st.columns(3)
     tot_e = df_rel.loc[df_rel["tipo"] == "Entrada", "valor"].sum()
     tot_s = df_rel.loc[df_rel["tipo"] == "Saida", "valor"].sum()
@@ -1402,7 +1407,7 @@ elif page in ("Painéis", "Dashboards"):
             template="plotly_white",
         )
         fig1.update_layout(legend_title_text="", margin=dict(l=10, r=10, t=50, b=10), yaxis_title="R$")
-        st.plotly_chart(fig1, config={**PLOTLY_CONFIG})
+        st.plotly_chart(fig1, config={**PLOTLY_CONFIG}, use_container_width=True)
     else:
         st.info("Sem movimentos **realizados** no período para montar o fluxo mensal.")
 
@@ -1424,7 +1429,7 @@ elif page in ("Painéis", "Dashboards"):
             template="plotly_white",
         )
         fig2.update_layout(xaxis_title="Data", yaxis_title="R$", margin=dict(l=10, r=10, t=50, b=10))
-        st.plotly_chart(fig2, config={**PLOTLY_CONFIG, "toImageButtonOptions": {"format": "png", "filename": "saldo_acumulado"}})
+        st.plotly_chart(fig2, config={**PLOTLY_CONFIG, "toImageButtonOptions": {"format": "png", "filename": "saldo_acumulado"}}, use_container_width=True)
     else:
         st.info("Sem movimentos **realizados** no período para montar o acumulado.")
 
@@ -1452,7 +1457,7 @@ elif page in ("Painéis", "Dashboards"):
             template="plotly_white",
         )
         fig3.update_layout(xaxis_title="Centro de Custo", yaxis_title="R$", legend_title_text="", margin=dict(l=10, r=10, t=50, b=10))
-        st.plotly_chart(fig3, config={**PLOTLY_CONFIG, "toImageButtonOptions": {"format": "png", "filename": "previsto_vs_realizado_cc"}})
+        st.plotly_chart(fig3, config={**PLOTLY_CONFIG, "toImageButtonOptions": {"format": "png", "filename": "previsto_vs_realizado_cc"}}, use_container_width=True)
 
     st.divider()
 
@@ -1465,6 +1470,6 @@ elif page in ("Painéis", "Dashboards"):
             gcat = saidas.groupby("categoria", as_index=False)["valor"].sum().sort_values("valor", ascending=False)
             fig4 = px.bar(gcat, x="categoria", y="valor", title="Total de Saídas por Categoria (Realizado)", template="plotly_white")
             fig4.update_layout(xaxis_title="Categoria", yaxis_title="R$", margin=dict(l=10, r=10, t=50, b=10))
-            st.plotly_chart(fig4, config={**PLOTLY_CONFIG, "toImageButtonOptions": {"format": "png", "filename": "gastos_por_categoria"}})
+            st.plotly_chart(fig4, config={**PLOTLY_CONFIG, "toImageButtonOptions": {"format": "png", "filename": "gastos_por_categoria"}}, use_container_width=True)
     else:
         st.info("Sem movimentos **realizados** para compor *Gastos por Categoria*.")
