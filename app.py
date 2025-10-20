@@ -391,18 +391,15 @@ def df_query_cached(sql: str) -> pd.DataFrame:
 def success(msg: str): st.toast(msg, icon="✅")
 def error(msg: str): st.toast(msg, icon="❌")
 
-# garantir dados mínimos ALTEREI E VER SER SE OK
+# garantir dados mínimos
 ensure_seed_data()
 
 with st.sidebar:
     st.title("💼 BK Gestão Financeira")
     st.caption(APP_VERSION)
-    PAGE_ID = page.lower().replace(" ", "_")
+    page = st.radio("Navegação", ["Home","Cadastro","Metas","Movimentações","Relatórios","Dashboards"], index=0, key="nav_page")
+    st.divider()
 
-    def k(s: str) -> str:
-        """Gera uma chave estável por página para widgets/plots."""
-        return f"{PAGE_ID}:{s}"
-#### FIM DA ALTERAÇÃO
 st.markdown("""
 <style>
 .stButton>button {border-radius: 12px; padding: .6rem 1rem;}
@@ -410,6 +407,14 @@ st.markdown("""
 .metric-card {background:#f8f9fb; border-radius:16px; padding:18px; border:1px solid #edf0f4}
 </style>
 """, unsafe_allow_html=True)
+
+# ALTERAÇÃO FEITA
+# ---- Keys únicas por página / seção ----
+def uikey(name: str) -> str:
+    """Gera uma key única e estável por página."""
+    page = st.session_state.get("nav_page", "root")
+    return f"{page}:{name}"
+# FIM DA ALTERAÇÃO
 
 def input_id_to_edit_delete(df: pd.DataFrame, label="ID", key: str = None):
     ids = [int(x) for x in (df["id"].tolist() if "id" in df.columns else [])]
@@ -428,15 +433,22 @@ def load_obj(session, model, obj_id: int):
 # ===========================
 if page == "Home":
     st.header("Visão Geral")
+
     col1, col2, col3, col4 = st.columns(4)
     with get_session() as s:
-        total_e = s.query(func.sum(Transacao.valor)).filter(Transacao.tipo=="Entrada", Transacao.foi_pago==True).scalar() or 0
-        total_s = s.query(func.sum(Transacao.valor)).filter(Transacao.tipo=="Saida",   Transacao.foi_pago==True).scalar() or 0
-    with col1: st.metric("Entradas (Pagas)",  money(total_e))
-    with col2: st.metric("Saídas (Pagas)",    money(total_s))
-    with col3: st.metric("Resultado",         money(total_e-total_s))
+        total_e = s.query(func.sum(Transacao.valor)).filter(
+            Transacao.tipo == "Entrada", Transacao.foi_pago == True
+        ).scalar() or 0
+        total_s = s.query(func.sum(Transacao.valor)).filter(
+            Transacao.tipo == "Saida", Transacao.foi_pago == True
+        ).scalar() or 0
+
+    with col1: st.metric("Entradas (Pagas)", money(total_e))
+    with col2: st.metric("Saídas (Pagas)",   money(total_s))
+    with col3: st.metric("Resultado",        money(total_e - total_s))
     with col4:
-        dfb = compute_bank_balances(); tot = dfb["saldo_atual"].sum() if not dfb.empty else 0.0
+        dfb = compute_bank_balances()
+        tot = dfb["saldo_atual"].sum() if not dfb.empty else 0.0
         st.metric("Saldo Total (Bancos)", money(tot))
 
     st.subheader("Saldos por Banco")
@@ -445,21 +457,27 @@ if page == "Home":
         st.info("Cadastre bancos em **Cadastro > Bancos**.")
     else:
         st.dataframe(
-            dfb[["nome","saldo_atual"]].rename(columns={"nome":"Banco","saldo_atual":"Saldo Atual"}),
+            dfb[["nome", "saldo_atual"]].rename(columns={"nome": "Banco", "saldo_atual": "Saldo Atual"}),
             use_container_width=True,
-            key=k("home_dfb")
+            key=uikey("home-saldos-bancos")
         )
 
     st.subheader("Próximos 30 dias — Fluxo Previsto")
     with get_session() as s:
         hoje = date.today(); fim = hoje + timedelta(days=30)
-        q = s.query(Transacao).filter(Transacao.data_prevista>=hoje, Transacao.data_prevista<=fim).order_by(Transacao.data_prevista)
+        q = s.query(Transacao).filter(
+            Transacao.data_prevista >= hoje,
+            Transacao.data_prevista <= fim
+        ).order_by(Transacao.data_prevista)
         df = pd.read_sql(q.statement, s.bind)
     if df.empty:
         st.info("Sem lançamentos previstos para os próximos 30 dias.")
     else:
-        st.dataframe(df[["id","tipo","valor","data_prevista","foi_pago","data_real","descricao"]],
-             use_container_width=True, key=k("home_prox30"))
+        st.dataframe(
+            df[["id","tipo","valor","data_prevista","foi_pago","data_real","descricao"]],
+            use_container_width=True,
+            key=uikey("home-prox30")
+        )
 
     st.subheader("Atrasados — Entradas/Saídas não pagas")
     if _is_sqlite(DB_URL):
@@ -494,20 +512,29 @@ if page == "Home":
             WHERE t.foi_pago={SQL_FALSE} AND DATE(t.data_prevista) < CURRENT_DATE
             ORDER BY t.data_prevista ASC
         """)
+
     if atrasados.empty:
         st.success("Não há lançamentos em atraso. 🎉")
     else:
         cE, cS = st.columns(2)
-        ent = atrasados[atrasados["tipo"]=="Entrada"].copy()
-        sai = atrasados[atrasados["tipo"]=="Saida"].copy()
+        ent = atrasados[atrasados["tipo"] == "Entrada"].copy()
+        sai = atrasados[atrasados["tipo"] == "Saida"].copy()
         with cE:
             st.caption("Entradas em atraso")
-            st.dataframe(ent[["id","categoria","subcategoria","cliente","valor","data_prevista","dias_atraso","descricao"]],
-                 use_container_width=True, key=k("home_atrasados_ent"))
+            st.dataframe(
+                ent[["id","categoria","subcategoria","cliente","valor","data_prevista","dias_atraso","descricao"]],
+                use_container_width=True,
+                key=uikey("home-atraso-ent")
+            )
+            st.metric("Total", money(ent["valor"].sum()))
         with cS:
             st.caption("Saídas em atraso")
-            st.dataframe(sai[["id","categoria","subcategoria","fornecedor","valor","data_prevista","dias_atraso","descricao"]],
-                 use_container_width=True, key=k("home_atrasados_sai"))
+            st.dataframe(
+                sai[["id","categoria","subcategoria","fornecedor","valor","data_prevista","dias_atraso","descricao"]],
+                use_container_width=True,
+                key=uikey("home-atraso-sai")
+            )
+            st.metric("Total", money(sai["valor"].sum()))
 
 # ===========================
 # Cadastro
@@ -1355,64 +1382,66 @@ elif page in ("Painéis", "Dashboards"):
         st.warning("Período inválido (início > fim). Ajustei automaticamente.")
         dt_ini, dt_fim = dt_fim, dt_ini
 
+    # --- consultas (use sempre pd.read_sql(sql, con, params=...) ---
     with get_session() as s:
-        df_real = pd_read_sql(
-            s.bind,
+        df_real = pd.read_sql(
             f"""
             SELECT t.id, t.tipo, t.valor,
-                t.data_prevista, t.foi_pago, t.data_real,
-                c.nome AS categoria, cc.nome AS centro_custo
+                   t.data_prevista, t.foi_pago, t.data_real,
+                   c.nome AS categoria, cc.nome AS centro_custo
             FROM transacoes t
             JOIN categorias c ON c.id = t.categoria_id
             LEFT JOIN centros_custo cc ON cc.id = t.centro_custo_id
             WHERE t.foi_pago = {sql_bool(True)}
-            AND DATE(t.data_real) BETWEEN :ini AND :fim
+              AND DATE(t.data_real) BETWEEN :ini AND :fim
             """,
-            params={"ini": dt_ini.isoformat(), "fim": dt_fim.isoformat()}
+            s.bind, params={"ini": dt_ini.isoformat(), "fim": dt_fim.isoformat()}
         )
 
-        df_prev = pd_read_sql(
-            s.bind,
+        df_prev = pd.read_sql(
             f"""
             SELECT t.id, t.tipo, t.valor,
-                t.data_prevista, t.foi_pago, t.data_real,
-                c.nome AS categoria, cc.nome AS centro_custo
+                   t.data_prevista, t.foi_pago, t.data_real,
+                   c.nome AS categoria, cc.nome AS centro_custo
             FROM transacoes t
             JOIN categorias c ON c.id = t.categoria_id
             LEFT JOIN centros_custo cc ON cc.id = t.centro_custo_id
             WHERE t.foi_pago = {sql_bool(False)}
-            AND DATE(t.data_prevista) BETWEEN :ini AND :fim
+              AND DATE(t.data_prevista) BETWEEN :ini AND :fim
             """,
-            params={"ini": dt_ini.isoformat(), "fim": dt_fim.isoformat()}
+            s.bind, params={"ini": dt_ini.isoformat(), "fim": dt_fim.isoformat()}
         )
 
     st.divider()
 
+    # --- Fluxo mensal (Realizado) — Entradas x Saídas ---
     st.subheader("Fluxo mensal (Realizado) — Entradas x Saídas")
     if not df_real.empty:
         dfm = df_real.copy()
         dfm["Mês"] = pd.to_datetime(dfm["data_real"]).dt.to_period("M").astype(str)
         g = (
             dfm.groupby(["Mês", "tipo"], as_index=False)["valor"]
-            .sum()
-            .pivot(index="Mês", columns="tipo", values="valor")
-            .fillna(0.0)
-            .reset_index()
+               .sum()
+               .pivot(index="Mês", columns="tipo", values="valor")
+               .fillna(0.0)
+               .reset_index()
         )
         if "Entrada" not in g.columns: g["Entrada"] = 0.0
         if "Saida"   not in g.columns: g["Saida"]   = 0.0
+
         fig1 = px.bar(
             g, x="Mês", y=["Entrada", "Saida"], barmode="group",
-            title=(f"Entradas x Saídas (Realizado) por mês — {dt_ini.strftime('%d/%m/%Y')} a {dt_fim.strftime('%d/%m/%Y')}"),
+            title=f"Entradas x Saídas (Realizado) por mês — {dt_ini.strftime('%d/%m/%Y')} a {dt_fim.strftime('%d/%m/%Y')}",
             template="plotly_white",
         )
         fig1.update_layout(legend_title_text="", margin=dict(l=10, r=10, t=50, b=10), yaxis_title="R$")
-        st.plotly_chart(fig1, config={**PLOTLY_CONFIG}, use_container_width=True)
+        st.plotly_chart(fig1, config=PLOTLY_CONFIG, use_container_width=True, key=uikey("dash-fig1"))
     else:
         st.info("Sem movimentos **realizados** no período para montar o fluxo mensal.")
 
     st.divider()
 
+    # --- Fluxo de Caixa — Saldo Acumulado (Realizado) ---
     st.subheader("Fluxo de Caixa — Saldo Acumulado (Realizado)")
     if not df_real.empty:
         acc = df_real.copy()
@@ -1420,47 +1449,71 @@ elif page in ("Painéis", "Dashboards"):
         acc["var"] = acc.apply(lambda r: r["valor"] if r["tipo"] == "Entrada" else -r["valor"], axis=1)
         daily = acc.groupby("dia", as_index=False)["var"].sum().sort_values("dia")
         idx = pd.date_range(start=dt_ini, end=dt_fim, freq="D")
-        daily = (daily.set_index("dia").reindex(idx, fill_value=0.0).rename_axis("dia").reset_index())
+        daily = daily.set_index("dia").reindex(idx, fill_value=0.0).rename_axis("dia").reset_index()
         daily["acumulado"] = daily["var"].cumsum()
         daily["dia"] = pd.to_datetime(daily["dia"]).dt.date
+
         fig2 = px.line(
             daily, x="dia", y="acumulado", markers=True,
             title=f"Saldo acumulado (de {dt_ini.strftime('%d/%m/%Y')} até {dt_fim.strftime('%d/%m/%Y')})",
             template="plotly_white",
         )
         fig2.update_layout(xaxis_title="Data", yaxis_title="R$", margin=dict(l=10, r=10, t=50, b=10))
-        st.plotly_chart(fig2, config={**PLOTLY_CONFIG, "toImageButtonOptions": {"format": "png", "filename": "saldo_acumulado"}}, use_container_width=True)
+        st.plotly_chart(
+            fig2,
+            config={**PLOTLY_CONFIG, "toImageButtonOptions": {"format": "png", "filename": "saldo_acumulado"}},
+            use_container_width=True,
+            key=uikey("dash-fig2")
+        )
     else:
         st.info("Sem movimentos **realizados** no período para montar o acumulado.")
 
     st.divider()
 
+    # --- Previsto vs. Realizado por Centro de Custo ---
     st.subheader("Previsto vs. Realizado por Centro de Custo")
     prev_cc = pd.DataFrame(columns=["centro_custo", "previsto"])
     if not df_prev.empty:
         p = df_prev.copy()
         p["centro_custo"] = p["centro_custo"].fillna("(sem CC)")
         prev_cc = p.groupby("centro_custo", as_index=False)["valor"].sum().rename(columns={"valor": "previsto"})
+
     real_cc = pd.DataFrame(columns=["centro_custo", "realizado"])
     if not df_real.empty:
         r = df_real.copy()
         r["centro_custo"] = r["centro_custo"].fillna("(sem CC)")
         real_cc = r.groupby("centro_custo", as_index=False)["valor"].sum().rename(columns={"valor": "realizado"})
+
     comp_cc = pd.merge(prev_cc, real_cc, on="centro_custo", how="outer").fillna(0.0)
+
     if comp_cc.empty:
         st.info("Sem dados de **previsto/realizado** por Centro de Custo no período.")
     else:
-        comp_cc_long = comp_cc.melt(id_vars="centro_custo", value_vars=["previsto", "realizado"], var_name="Tipo", value_name="Valor")
+        comp_cc_long = comp_cc.melt(
+            id_vars="centro_custo",
+            value_vars=["previsto", "realizado"],
+            var_name="Tipo",
+            value_name="Valor"
+        )
         fig3 = px.bar(
             comp_cc_long, x="centro_custo", y="Valor", color="Tipo", barmode="group",
             title="Previsto vs. Realizado por Centro de Custo (período selecionado)",
             template="plotly_white",
         )
-        fig3.update_layout(xaxis_title="Centro de Custo", yaxis_title="R$", legend_title_text="", margin=dict(l=10, r=10, t=50, b=10))
-        st.plotly_chart(fig3, config={**PLOTLY_CONFIG, "toImageButtonOptions": {"format": "png", "filename": "previsto_vs_realizado_cc"}}, use_container_width=True)
+        fig3.update_layout(
+            xaxis_title="Centro de Custo", yaxis_title="R$", legend_title_text="",
+            margin=dict(l=10, r=10, t=50, b=10)
+        )
+        st.plotly_chart(
+            fig3,
+            config={**PLOTLY_CONFIG, "toImageButtonOptions": {"format": "png", "filename": "previsto_vs_realizado_cc"}},
+            use_container_width=True,
+            key=uikey("dash-fig3")
+        )
 
     st.divider()
 
+    # --- Gastos por Categoria (Saídas — Realizado) ---
     st.subheader("Gastos por Categoria (Saídas — Realizado)")
     if not df_real.empty:
         saidas = df_real[df_real["tipo"] == "Saida"].copy()
@@ -1468,8 +1521,17 @@ elif page in ("Painéis", "Dashboards"):
             st.info("Não há **saídas realizadas** no período.")
         else:
             gcat = saidas.groupby("categoria", as_index=False)["valor"].sum().sort_values("valor", ascending=False)
-            fig4 = px.bar(gcat, x="categoria", y="valor", title="Total de Saídas por Categoria (Realizado)", template="plotly_white")
+            fig4 = px.bar(
+                gcat, x="categoria", y="valor",
+                title="Total de Saídas por Categoria (Realizado)",
+                template="plotly_white"
+            )
             fig4.update_layout(xaxis_title="Categoria", yaxis_title="R$", margin=dict(l=10, r=10, t=50, b=10))
-            st.plotly_chart(fig4, config={**PLOTLY_CONFIG, "toImageButtonOptions": {"format": "png", "filename": "gastos_por_categoria"}}, use_container_width=True)
+            st.plotly_chart(
+                fig4,
+                config={**PLOTLY_CONFIG, "toImageButtonOptions": {"format": "png", "filename": "gastos_por_categoria"}},
+                use_container_width=True,
+                key=uikey("dash-fig4")
+            )
     else:
         st.info("Sem movimentos **realizados** para compor *Gastos por Categoria*.")
