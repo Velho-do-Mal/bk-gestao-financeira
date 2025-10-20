@@ -95,13 +95,13 @@ SQL_FALSE = "0" if _is_sqlite(DB_URL) else "FALSE"
 # --- FORÇAR IPv4 NA URL DO POSTGRES (evita resolver para IPv6) ---
 def _force_ipv4_in_pg_url(url: str) -> str:
     """
-    Força uso de IPv4 em conexões Postgres adicionando ?hostaddr=<A-record>
-    Funciona com URLs:
+    1) Adiciona ?hostaddr=<IPv4> quando possível (mantém host original p/ TLS SNI).
+    2) Se houver qualquer indício de que o driver ainda está indo por IPv6,
+       reescreve o host para o IPv4 (fallback agressivo).
+    Suporta:
       - postgresql://
-      - postgresql+psycopg://   (psycopg3)
-      - postgresql+psycopg2://  (psycopg2)
-    Mantém o 'host' original para não quebrar o TLS (SNI/cert).
-    Se já houver hostaddr=, não altera.
+      - postgresql+psycopg://
+      - postgresql+psycopg2://
     """
     try:
         s = str(url or "")
@@ -112,38 +112,72 @@ def _force_ipv4_in_pg_url(url: str) -> str:
         import socket
 
         u = urlsplit(s)
-        # Não duplica se já existir hostaddr
-        q = dict(parse_qsl(u.query, keep_blank_values=True))
-        if "hostaddr" in q or not u.hostname:
+        if not u.hostname:
             return url
 
-        # Resolve apenas IPv4
+        # Resolve somente IPv4
         infos = socket.getaddrinfo(u.hostname, (u.port or 5432), socket.AF_INET, socket.SOCK_STREAM)
         ipv4 = infos[0][4][0] if infos else None
         if not ipv4:
             return url
 
-        q["hostaddr"] = ipv4
-        # garanta SSL se estiver ausente (Supabase exige)
+        # Passo 1: adiciona hostaddr= e sslmode=require (se ausente)
+        q = dict(parse_qsl(u.query, keep_blank_values=True))
+        changed = False
+        if "hostaddr" not in q:
+            q["hostaddr"] = ipv4
+            changed = True
         if "sslmode" not in q:
             q["sslmode"] = "require"
+            changed = True
+        url1 = urlunsplit((u.scheme, u.netloc, u.path, urlencode(q), u.fragment)) if changed else s
 
-        new_query = urlencode(q)
-        return urlunsplit((u.scheme, u.netloc, u.path, new_query, u.fragment))
+        # Passo 2 (fallback): se por algum motivo o driver ignorar hostaddr,
+        # oferecemos também uma versão com o host substituído por IPv4.
+        if u.hostname != ipv4:
+            netloc_ipv4 = url1.replace(f"//{u.netloc}", f"//{u.username + ':' + u.password + '@' if u.username else ''}{ipv4}{':' + str(u.port) if u.port else ''}", 1)
+        else:
+            netloc_ipv4 = url1
+
+        # Exporta as duas: a "preferida" (com hostaddr) primeiro; se falhar, tentaremos a IPv4 pura no create_engine.
+        return url1 + "||" + netloc_ipv4  # truque: carregaremos a primeira; se der erro, tentamos a segunda.
     except Exception:
         return url
+
 
 DB_URL = _force_ipv4_in_pg_url(DB_URL)
 
 # ===========================
-# Engine e Session (com pool no Postgres)
+# Engine e Session (com pool no Postgres + fallback IPv4)
 # ===========================
-connect_args = {"check_same_thread": False} if _is_sqlite(DB_URL) else {}
-pool_kwargs = {}
-if not _is_sqlite(DB_URL):
-    pool_kwargs = dict(pool_size=5, max_overflow=10, pool_pre_ping=True, pool_recycle=1800)
 
-ENGINE = create_engine(DB_URL, echo=False, future=True, connect_args=connect_args, **pool_kwargs)
+def _create_engine_with_ipv4_fallback(db_url: str):
+    """
+    Se vier no formato 'url1||url2', tenta a primeira URL e,
+    se der erro de conexão, tenta a segunda automaticamente.
+    """
+    urls = str(db_url).split("||")
+    last_err = None
+    for u in urls:
+        try:
+            eng = create_engine(
+                u,
+                echo=False,
+                future=True,
+                connect_args={"check_same_thread": False} if _is_sqlite(u) else {},
+                **({} if _is_sqlite(u) else dict(pool_size=5, max_overflow=10, pool_pre_ping=True, pool_recycle=1800))
+            )
+            # Testa conexão imediatamente
+            with eng.connect() as c:
+                c.exec_driver_sql("select 1")
+            return eng
+        except Exception as e:
+            last_err = e
+    raise last_err
+
+
+# Criação do engine usando o fallback automático
+ENGINE = _create_engine_with_ipv4_fallback(DB_URL)
 
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, autocommit=False, expire_on_commit=False)
 Base = declarative_base()
@@ -479,7 +513,7 @@ if page == "Home":
     else:
         st.dataframe(
             dfb[["nome", "saldo_atual"]].rename(columns={"nome": "Banco", "saldo_atual": "Saldo Atual"}),
-            use_container_width=True,
+            width='stretch',
             key=uikey("home-saldos-bancos")
         )
 
@@ -496,7 +530,7 @@ if page == "Home":
     else:
         st.dataframe(
             df[["id","tipo","valor","data_prevista","foi_pago","data_real","descricao"]],
-            use_container_width=True,
+            width='stretch',
             key=uikey("home-prox30")
         )
 
@@ -544,7 +578,7 @@ if page == "Home":
             st.caption("Entradas em atraso")
             st.dataframe(
                 ent[["id","categoria","subcategoria","cliente","valor","data_prevista","dias_atraso","descricao"]],
-                use_container_width=True,
+                width='stretch',
                 key=uikey("home-atraso-ent")
             )
             st.metric("Total", money(ent["valor"].sum()))
@@ -552,7 +586,7 @@ if page == "Home":
             st.caption("Saídas em atraso")
             st.dataframe(
                 sai[["id","categoria","subcategoria","fornecedor","valor","data_prevista","dias_atraso","descricao"]],
-                use_container_width=True,
+                width='stretch',
                 key=uikey("home-atraso-sai")
             )
             st.metric("Total", money(sai["valor"].sum()))
@@ -580,7 +614,7 @@ elif page == "Cadastro":
                         s.add(Cliente(nome=nome, documento=doc, email=email, telefone=tel))
                         _done(s, "Cliente cadastrado.")
         df_cli = df_query_cached("SELECT id, nome, documento, email, telefone, created_at FROM clientes ORDER BY id DESC")
-        st.dataframe(df_cli, use_container_width=True)
+        st.dataframe(df_cli, width='stretch')
         colE, colD = st.columns(2)
         with colE:
             st.markdown("**Editar Cliente**")
@@ -625,7 +659,7 @@ elif page == "Cadastro":
                         s.add(Fornecedor(nome=nome, documento=doc, email=email, telefone=tel))
                         _done(s, "Fornecedor cadastrado.")
         df_f = df_query_cached("SELECT id, nome, documento, email, telefone, created_at FROM fornecedores ORDER BY id DESC")
-        st.dataframe(df_f, use_container_width=True)
+        st.dataframe(df_f, width='stretch')
         colE, colD = st.columns(2)
         with colE:
             st.markdown("**Editar Fornecedor**")
@@ -670,7 +704,7 @@ elif page == "Cadastro":
                         s.add(Banco(nome=nome, saldo_inicial=float(saldo)))
                         _done(s, "Banco cadastrado.")
         df_b = df_query_cached("SELECT id, nome, saldo_inicial, created_at FROM bancos ORDER BY id DESC")
-        st.dataframe(df_b, use_container_width=True)
+        st.dataframe(df_b, width='stretch')
         colE, colD = st.columns(2)
         with colE:
             st.markdown("**Editar Banco**")
@@ -724,7 +758,7 @@ elif page == "Cadastro":
                         s.add(Categoria(tipo=cat_add_tipo, nome=nome_final))
                         _done(s, "Categoria cadastrada.")
         df_c = df_query_cached("SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome")
-        st.dataframe(df_c, use_container_width=True)
+        st.dataframe(df_c, width='stretch')
         colE, colD = st.columns(2)
         with colE:
             st.markdown("**Editar Categoria**")
@@ -804,7 +838,7 @@ elif page == "Cadastro":
             FROM subcategorias s JOIN categorias c ON c.id=s.categoria_id
             ORDER BY c.tipo, c.nome, s.nome
         """)
-        st.dataframe(df_sc, use_container_width=True)
+        st.dataframe(df_sc, width='stretch')
         colE, colD = st.columns(2)
         with colE:
             st.markdown("**Editar Subcategoria**")
@@ -858,7 +892,7 @@ elif page == "Cadastro":
                         s.add(CentroCusto(nome=nome, descricao=desc))
                         _done(s, "Centro de custo cadastrado.")
         df_cc = df_query_cached("SELECT id, nome, descricao FROM centros_custo ORDER BY nome")
-        st.dataframe(df_cc, use_container_width=True)
+        st.dataframe(df_cc, width='stretch')
         colE, colD = st.columns(2)
         with colE:
             st.markdown("**Editar Centro de Custo**")
@@ -925,7 +959,7 @@ elif page == "Metas":
             WHERE m.ano=:ano AND m.mes=:mes
             ORDER BY c.tipo, categoria, subcategoria
         """, params={"ano": int(ano), "mes": int(mes)})
-    st.dataframe(dfm, use_container_width=True)
+    st.dataframe(dfm, width='stretch')
     colE, colD = st.columns(2)
     with colE:
         st.markdown("**Editar Meta**")
@@ -1086,7 +1120,7 @@ elif page == "Movimentações":
                 LEFT JOIN bancos b ON b.id = t.banco_id
                 ORDER BY t.data_prevista DESC, t.id DESC
             """)
-        st.dataframe(df_tx, use_container_width=True)
+        st.dataframe(df_tx, width='stretch')
 
         colE, colD = st.columns(2)
         # Editar
@@ -1269,7 +1303,7 @@ elif page == "Movimentações":
                 JOIN bancos b2 ON b2.id = t.banco_destino_id
                 ORDER BY t.data_prevista DESC, t.id DESC
             """)
-        st.dataframe(dft, use_container_width=True)
+        st.dataframe(dft, width='stretch')
 
         exec_id = input_id_to_edit_delete(dft, "ID para executar/desfazer", key="trf_exec_id") if not dft.empty else None
         colx1, colx2 = st.columns(2)
@@ -1369,7 +1403,7 @@ elif page == "Relatórios":
             params={"d1": dt_ini.isoformat(), "d2": dt_fim.isoformat()},
         )
 
-    st.dataframe(df_rel, use_container_width=True)
+    st.dataframe(df_rel, width='stretch')
     colT1, colT2, colT3 = st.columns(3)
     tot_e = df_rel.loc[df_rel["tipo"] == "Entrada", "valor"].sum()
     tot_s = df_rel.loc[df_rel["tipo"] == "Saida", "valor"].sum()
@@ -1456,7 +1490,7 @@ elif page in ("Painéis", "Dashboards"):
             template="plotly_white",
         )
         fig1.update_layout(legend_title_text="", margin=dict(l=10, r=10, t=50, b=10), yaxis_title="R$")
-        st.plotly_chart(fig1, config=PLOTLY_CONFIG, use_container_width=True, key=uikey("dash-fig1"))
+        st.plotly_chart(fig1, config=PLOTLY_CONFIG, width='stretch', key=uikey("dash-fig1"))
     else:
         st.info("Sem movimentos **realizados** no período para montar o fluxo mensal.")
 
@@ -1483,7 +1517,7 @@ elif page in ("Painéis", "Dashboards"):
         st.plotly_chart(
             fig2,
             config={**PLOTLY_CONFIG, "toImageButtonOptions": {"format": "png", "filename": "saldo_acumulado"}},
-            use_container_width=True,
+            width='stretch',
             key=uikey("dash-fig2")
         )
     else:
@@ -1528,7 +1562,7 @@ elif page in ("Painéis", "Dashboards"):
         st.plotly_chart(
             fig3,
             config={**PLOTLY_CONFIG, "toImageButtonOptions": {"format": "png", "filename": "previsto_vs_realizado_cc"}},
-            use_container_width=True,
+            width='stretch',
             key=uikey("dash-fig3")
         )
 
@@ -1551,7 +1585,7 @@ elif page in ("Painéis", "Dashboards"):
             st.plotly_chart(
                 fig4,
                 config={**PLOTLY_CONFIG, "toImageButtonOptions": {"format": "png", "filename": "gastos_por_categoria"}},
-                use_container_width=True,
+                width='stretch',
                 key=uikey("dash-fig4")
             )
     else:
