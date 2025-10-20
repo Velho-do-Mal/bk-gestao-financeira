@@ -94,20 +94,40 @@ SQL_FALSE = "0" if _is_sqlite(DB_URL) else "FALSE"
 
 # --- FORÇAR IPv4 NA URL DO POSTGRES (evita resolver para IPv6) ---
 def _force_ipv4_in_pg_url(url: str) -> str:
+    """
+    Força uso de IPv4 em conexões Postgres adicionando ?hostaddr=<A-record>
+    Funciona com URLs:
+      - postgresql://
+      - postgresql+psycopg://   (psycopg3)
+      - postgresql+psycopg2://  (psycopg2)
+    Mantém o 'host' original para não quebrar o TLS (SNI/cert).
+    Se já houver hostaddr=, não altera.
+    """
     try:
-        # Suporta psycopg v3 (driver "psycopg")
-        if not str(url).startswith("postgresql+psycopg://"):
+        s = str(url or "")
+        if not s.startswith("postgresql"):
             return url
+
         from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
         import socket
-        u = urlsplit(url)
-        host, port = u.hostname, (u.port or 5432)
-        infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)  # IPv4 only
+
+        u = urlsplit(s)
+        # Não duplica se já existir hostaddr
+        q = dict(parse_qsl(u.query, keep_blank_values=True))
+        if "hostaddr" in q or not u.hostname:
+            return url
+
+        # Resolve apenas IPv4
+        infos = socket.getaddrinfo(u.hostname, (u.port or 5432), socket.AF_INET, socket.SOCK_STREAM)
         ipv4 = infos[0][4][0] if infos else None
         if not ipv4:
             return url
-        q = dict(parse_qsl(u.query, keep_blank_values=True))
-        q["hostaddr"] = ipv4  # psycopg usa este IPv4 direto
+
+        q["hostaddr"] = ipv4
+        # garanta SSL se estiver ausente (Supabase exige)
+        if "sslmode" not in q:
+            q["sslmode"] = "require"
+
         new_query = urlencode(q)
         return urlunsplit((u.scheme, u.netloc, u.path, new_query, u.fragment))
     except Exception:
@@ -124,6 +144,7 @@ if not _is_sqlite(DB_URL):
     pool_kwargs = dict(pool_size=5, max_overflow=10, pool_pre_ping=True, pool_recycle=1800)
 
 ENGINE = create_engine(DB_URL, echo=False, future=True, connect_args=connect_args, **pool_kwargs)
+
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, autocommit=False, expire_on_commit=False)
 Base = declarative_base()
 
