@@ -153,8 +153,8 @@ DB_URL = _force_ipv4_in_pg_url(DB_URL)
 
 def _create_engine_with_ipv4_fallback(db_url: str):
     """
-    Se vier no formato 'url1||url2', tenta a primeira URL e,
-    se der erro de conexão, tenta a segunda automaticamente.
+    Se vier no formato 'url1||url2', tenta criar o engine com a primeira URL;
+    se der erro na criação do engine, tenta a segunda. NÃO testa conexão aqui.
     """
     urls = str(db_url).split("||")
     last_err = None
@@ -167,20 +167,28 @@ def _create_engine_with_ipv4_fallback(db_url: str):
                 connect_args={"check_same_thread": False} if _is_sqlite(u) else {},
                 **({} if _is_sqlite(u) else dict(pool_size=5, max_overflow=10, pool_pre_ping=True, pool_recycle=1800))
             )
-            # Testa conexão imediatamente
-            with eng.connect() as c:
-                c.exec_driver_sql("select 1")
             return eng
         except Exception as e:
             last_err = e
+    # se nada deu certo, propaga o último erro
     raise last_err
 
 
-# Criação do engine usando o fallback automático
-ENGINE = _create_engine_with_ipv4_fallback(DB_URL)
+# Criação do engine com fallback automático + fallback final para SQLite local
+try:
+    ENGINE = _create_engine_with_ipv4_fallback(DB_URL)
+except Exception:
+    # Falhou criar engine para Postgres (ou URL inválida). Cai para SQLite local.
+    base_dir = os.path.abspath(os.path.dirname(__file__))
+    local_data_dir = os.path.join(base_dir, "data")
+    os.makedirs(local_data_dir, exist_ok=True)
+    DB_URL = f"sqlite:///{os.path.join(local_data_dir, 'bk_finance_fallback.db')}"
+    _ensure_sqlite_dir_if_needed(DB_URL)
+    ENGINE = create_engine(DB_URL, echo=False, future=True, connect_args={"check_same_thread": False})
 
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, autocommit=False, expire_on_commit=False)
 Base = declarative_base()
+
 
 # DEBUG (opcional, sem vazar senha)
 with st.sidebar:
