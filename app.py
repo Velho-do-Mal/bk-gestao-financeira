@@ -1,1603 +1,2445 @@
-# -*- coding: utf-8 -*-
-
-from __future__ import annotations
-
-# BK Engenharia e Tecnologia — App de Gestão Financeira (arquivo único)
-# Python: 3.13 | Streamlit + SQLAlchemy | SQLite/Cloud
-
-import os, io, re, unicodedata, warnings
-from datetime import date, datetime, timedelta
-from dateutil.relativedelta import relativedelta
-from typing import Optional
-
+import streamlit as st
+import streamlit.components.v1 as components  # IMPORT CORRETO PARA HTML
+import psycopg2
+import json
+from datetime import datetime, date, timedelta
 import pandas as pd
 import plotly.express as px
-import streamlit as st
 
-# ==== IMPORTS SQLALCHEMY ====
-from sqlalchemy import (
-    create_engine, Column, Integer, String, Float, Date, DateTime, Boolean, Text,
-    ForeignKey, func, text   # <- text para binds
+# --------------------------------------------------------
+# CONFIGURAÇÃO BÁSICA / CSS
+# --------------------------------------------------------
+
+st.set_page_config(
+    page_title="Gestão de Projetos PMBOK - BK Engenharia",
+    layout="wide"
 )
-from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 
-warnings.filterwarnings("ignore", message="The keyword arguments have been deprecated")
-
-# ===========================
-# Configurações Gerais
-# ===========================
-APP_TITLE = "BK Gestão Financeira"
-APP_VERSION = "v1.9.3"
-
-st.set_page_config(page_title=APP_TITLE, page_icon="💼", layout="wide", initial_sidebar_state="expanded")
-
-# ===========================
-# Helpers de URL/FS para SQLite
-# ===========================
-def _is_sqlite(url: str) -> bool:
-    return str(url).lower().startswith("sqlite:")
-
-def _ensure_sqlite_dir_if_needed(url: str) -> None:
-    """Garante a pasta do arquivo SQLite."""
-    if not _is_sqlite(url):
-        return
-    path = url.replace("sqlite:///", "", 1)
-    # Corrige caso Streamlit entregue '/C:/...' no Windows
-    if path.startswith("/") and len(path) > 2 and path[2] == ":":
-        path = path[1:]
-    folder = os.path.dirname(path)
-    if folder and not os.path.exists(folder):
-        os.makedirs(folder, exist_ok=True)
-
-def sql_bool(v: bool) -> str:
-    """Retorna como representar booleano em SQL para o dialeto atual."""
-    return ("1" if v else "0") if _is_sqlite(DB_URL) else ("TRUE" if v else "FALSE")
-
-def _sanitize_filename(name: str) -> str:
-    name = os.path.basename(name)
-    name = unicodedata.normalize("NFKD", name)
-    name = name.encode("ascii", "ignore").decode("ascii")
-    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
-    return name.strip("._") or "arquivo"
-
-# ===========================
-# Secrets/Config (robusto com fallback)
-# ===========================
-def _get_secret(section: str, key: str, default=None):
-    try:
-        sect = st.secrets.get(section, {})
-        if not isinstance(sect, dict):
-            sect = dict(sect)
-        return sect.get(key, default)
-    except Exception:
-        return default
-
-# --- Leitura da config
-DB_URL = os.environ.get("DATABASE_URL") or _get_secret("general", "database_url")
-ATTACH_DIR = os.environ.get("ATTACH_DIR") or _get_secret("general", "attach_dir", "anexos")
-
-# Fallback local caso não tenha secrets/env:
-if not DB_URL:
-    base_dir = os.path.abspath(os.path.dirname(__file__))
-    local_data_dir = os.path.join(base_dir, "data")
-    os.makedirs(local_data_dir, exist_ok=True)
-    DB_URL = f"sqlite:///{os.path.join(local_data_dir, 'bk_finance.db')}"
-
-# Pastas
-os.makedirs(ATTACH_DIR, exist_ok=True)
-_ensure_sqlite_dir_if_needed(DB_URL)
-
-# --- helpers de boolean em SQL cru (SQLite vs Postgres)
-SQL_TRUE  = "1" if _is_sqlite(DB_URL) else "TRUE"
-SQL_FALSE = "0" if _is_sqlite(DB_URL) else "FALSE"
-# --- fim helpers
-
-# --- FORÇAR IPv4 NA URL DO POSTGRES (evita resolver para IPv6) ---
-def _force_ipv4_in_pg_url(url: str) -> str:
-    """
-    1) Adiciona ?hostaddr=<IPv4> quando possível (mantém host original p/ TLS SNI).
-    2) Se houver qualquer indício de que o driver ainda está indo por IPv6,
-       reescreve o host para o IPv4 (fallback agressivo).
-    Suporta:
-      - postgresql://
-      - postgresql+psycopg://
-      - postgresql+psycopg2://
-    """
-    try:
-        s = str(url or "")
-        if not s.startswith("postgresql"):
-            return url
-
-        from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
-        import socket
-
-        u = urlsplit(s)
-        if not u.hostname:
-            return url
-
-        # Resolve somente IPv4
-        infos = socket.getaddrinfo(u.hostname, (u.port or 5432), socket.AF_INET, socket.SOCK_STREAM)
-        ipv4 = infos[0][4][0] if infos else None
-        if not ipv4:
-            return url
-
-        # Passo 1: adiciona hostaddr= e sslmode=require (se ausente)
-        q = dict(parse_qsl(u.query, keep_blank_values=True))
-        changed = False
-        if "hostaddr" not in q:
-            q["hostaddr"] = ipv4
-            changed = True
-        if "sslmode" not in q:
-            q["sslmode"] = "require"
-            changed = True
-        url1 = urlunsplit((u.scheme, u.netloc, u.path, urlencode(q), u.fragment)) if changed else s
-
-        # Passo 2 (fallback): se por algum motivo o driver ignorar hostaddr,
-        # oferecemos também uma versão com o host substituído por IPv4.
-        if u.hostname != ipv4:
-            netloc_ipv4 = url1.replace(f"//{u.netloc}", f"//{u.username + ':' + u.password + '@' if u.username else ''}{ipv4}{':' + str(u.port) if u.port else ''}", 1)
-        else:
-            netloc_ipv4 = url1
-
-        # Exporta as duas: a "preferida" (com hostaddr) primeiro; se falhar, tentaremos a IPv4 pura no create_engine.
-        return url1 + "||" + netloc_ipv4  # truque: carregaremos a primeira; se der erro, tentamos a segunda.
-    except Exception:
-        return url
-
-
-DB_URL = _force_ipv4_in_pg_url(DB_URL)
-
-# ===========================
-# Engine e Session (com pool no Postgres + fallback IPv4)
-# ===========================
-
-def _create_engine_with_ipv4_fallback(db_url: str):
-    """
-    Se vier no formato 'url1||url2', tenta criar o engine com a primeira URL;
-    se der erro na criação do engine, tenta a segunda. NÃO testa conexão aqui.
-    """
-    urls = str(db_url).split("||")
-    last_err = None
-    for u in urls:
-        try:
-            eng = create_engine(
-                u,
-                echo=False,
-                future=True,
-                connect_args={"check_same_thread": False} if _is_sqlite(u) else {},
-                **({} if _is_sqlite(u) else dict(pool_size=5, max_overflow=10, pool_pre_ping=True, pool_recycle=1800))
-            )
-            return eng
-        except Exception as e:
-            last_err = e
-    # se nada deu certo, propaga o último erro
-    raise last_err
-
-
-# Criação do engine com fallback automático + fallback final para SQLite local
-try:
-    ENGINE = _create_engine_with_ipv4_fallback(DB_URL)
-except Exception:
-    # Falhou criar engine para Postgres (ou URL inválida). Cai para SQLite local.
-    base_dir = os.path.abspath(os.path.dirname(__file__))
-    local_data_dir = os.path.join(base_dir, "data")
-    os.makedirs(local_data_dir, exist_ok=True)
-    DB_URL = f"sqlite:///{os.path.join(local_data_dir, 'bk_finance_fallback.db')}"
-    _ensure_sqlite_dir_if_needed(DB_URL)
-    ENGINE = create_engine(DB_URL, echo=False, future=True, connect_args={"check_same_thread": False})
-
-SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, autocommit=False, expire_on_commit=False)
-Base = declarative_base()
-
-
-# DEBUG (opcional, sem vazar senha)
-with st.sidebar:
-    st.divider()
-    _dbg = st.checkbox("Modo debug", value=False)
-if _dbg:
-    try:
-        from urllib.parse import urlsplit, urlunsplit
-        u = urlsplit(DB_URL)
-        # Mascara a senha
-        netloc = f"{u.username or ''}:{'***' if u.password else ''}@{u.hostname or ''}:{u.port or ''}"
-        st.caption(f"Dialeto: {ENGINE.dialect.name} • Driver: {ENGINE.dialect.driver}")
-        st.code(urlunsplit((u.scheme, netloc, u.path, u.query, u.fragment)), language="text")
-    except Exception as _e:
-        st.warning(f"Debug falhou: {type(_e).__name__}: {_e}")
-
-# Teste de conexão explícito (antes de criar tabelas)
-try:
-    with ENGINE.connect() as conn:
-        conn.exec_driver_sql("select 1")
-except Exception as e:
-    st.error("❌ Não consegui conectar ao banco de dados (verifique secrets.toml).")
-    st.code(str(e), language="text")
-    st.info("""Checklist:
-
-- O seu requirements.txt tem `psycopg[binary]` (ou `psycopg2-binary`)?
-- A `database_url` no secrets está no formato SQLAlchemy?
-  Exemplo Supabase: postgresql+psycopg://postgres:BKengMNKeng@db.rniljfoxfjwuhhockbiv.supabase.co:5432/postgres?sslmode=require
-- Usuário/senha corretos (Database Password do Supabase)?
-- Salvou os *Secrets* e reiniciou o app?
-""")
-    st.stop()
-
-# ===========================
-# Models
-# ===========================
-class Cliente(Base):
-    __tablename__ = "clientes"
-    id = Column(Integer, primary_key=True)
-    nome = Column(String, unique=True, nullable=False)
-    documento = Column(String); email = Column(String); telefone = Column(String)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-class Fornecedor(Base):
-    __tablename__ = "fornecedores"
-    id = Column(Integer, primary_key=True)
-    nome = Column(String, unique=True, nullable=False)
-    documento = Column(String); email = Column(String); telefone = Column(String)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-class Banco(Base):
-    __tablename__ = "bancos"
-    id = Column(Integer, primary_key=True)
-    nome = Column(String, unique=True, nullable=False)
-    saldo_inicial = Column(Float, default=0.0)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-class CentroCusto(Base):
-    __tablename__ = "centros_custo"
-    id = Column(Integer, primary_key=True)
-    nome = Column(String, unique=True, nullable=False)
-    descricao = Column(String)
-
-class Categoria(Base):
-    __tablename__ = "categorias"
-    id = Column(Integer, primary_key=True)
-    tipo = Column(String, nullable=False)  # Entrada | Saida
-    nome = Column(String, nullable=False)
-
-class Subcategoria(Base):
-    __tablename__ = "subcategorias"
-    id = Column(Integer, primary_key=True)
-    categoria_id = Column(Integer, ForeignKey("categorias.id"), nullable=False)
-    nome = Column(String, nullable=False)
-    categoria = relationship("Categoria")
-
-class Meta(Base):
-    __tablename__ = "metas"
-    id = Column(Integer, primary_key=True)
-    ano = Column(Integer, nullable=False)
-    mes = Column(Integer, nullable=False)
-    categoria_id = Column(Integer, ForeignKey("categorias.id"), nullable=False)
-    subcategoria_id = Column(Integer, ForeignKey("subcategorias.id"))
-    valor_previsto = Column(Float, default=0.0)
-
-class Transacao(Base):
-    __tablename__ = "transacoes"
-    id = Column(Integer, primary_key=True)
-    tipo = Column(String, nullable=False)  # Entrada | Saida
-    categoria_id = Column(Integer, ForeignKey("categorias.id"), nullable=False)
-    subcategoria_id = Column(Integer, ForeignKey("subcategorias.id"))
-    valor = Column(Float, nullable=False)
-    data_prevista = Column(Date, nullable=False)
-    foi_pago = Column(Boolean, default=False)
-    data_real = Column(Date)
-    centro_custo_id = Column(Integer, ForeignKey("centros_custo.id"))
-    cliente_id = Column(Integer, ForeignKey("clientes.id"))
-    fornecedor_id = Column(Integer, ForeignKey("fornecedores.id"))
-    banco_id = Column(Integer, ForeignKey("bancos.id"))
-    descricao = Column(Text)
-    recorrencia = Column(String, default="Unica")  # Unica | Mensal | Anual | Parcelado
-    parcelas_total = Column(Integer)
-    parcela_index = Column(Integer)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-class Anexo(Base):
-    __tablename__ = "anexos"
-    id = Column(Integer, primary_key=True)
-    transacao_id = Column(Integer, ForeignKey("transacoes.id"), nullable=False)
-    filename = Column(String, nullable=False)
-    path = Column(String, nullable=False)
-    uploaded_at = Column(DateTime, default=datetime.utcnow)
-
-class Transferencia(Base):
-    __tablename__ = "transferencias"
-    id = Column(Integer, primary_key=True)
-    banco_origem_id = Column(Integer, ForeignKey("bancos.id"), nullable=False)
-    banco_destino_id = Column(Integer, ForeignKey("bancos.id"), nullable=False)
-    valor = Column(Float, nullable=False)
-    data_prevista = Column(Date, nullable=False)
-    foi_executada = Column(Boolean, default=False)
-    data_real = Column(Date)
-    descricao = Column(Text)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-# criar tabelas (agora que os models existem)
-Base.metadata.create_all(bind=ENGINE)
-
-# ===========================
-# Utils
-# ===========================
-def get_session():
-    return SessionLocal()
-
-def df_query(sql: str, params: dict|None=None) -> pd.DataFrame:
-    """Leitura padrão. Usa text(sql) quando há params para habilitar binds."""
-    with ENGINE.connect() as conn:
-        if params:
-            return pd.read_sql(text(sql), conn, params=params)
-        return pd.read_sql(sql, conn)
-
-def pd_read_sql(bind, sql: str, params: dict|None=None) -> pd.DataFrame:
-    """Helper para usar em sessões .bind com/sem params."""
-    if params:
-        return pd.read_sql(text(sql), bind, params=params)
-    return pd.read_sql(sql, bind)
-
-def money(v: float) -> str:
-    try:
-        return f"R$ {float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    except Exception:
-        return "R$ 0,00"
-
-def extract_id(label: Optional[str]) -> Optional[int]:
-    if not label: return None
-    m = re.search(r"#\s*(\d+)", str(label))
-    return int(m.group(1)) if m else None
-
-def ensure_seed_data():
-    with get_session() as s:
-        if not s.query(Banco).first():
-            s.add(Banco(nome="Banco Principal", saldo_inicial=10000.00))
-        if not s.query(Categoria).filter_by(tipo="Entrada").first():
-            s.add(Categoria(tipo="Entrada", nome="Vendas"))
-        if not s.query(Categoria).filter_by(tipo="Saida").first():
-            s.add(Categoria(tipo="Saida", nome="Despesas Gerais"))
-        if not s.query(CentroCusto).first():
-            s.add(CentroCusto(nome="Geral", descricao="Padrão"))
-        s.commit()
-
-def _done(session, msg: str):
-    session.commit()
-    st.cache_data.clear()
-    st.toast(msg, icon="✅")
-    st.rerun()
-
-def compute_bank_balances() -> pd.DataFrame:
-    with get_session() as s:
-        bancos = pd_read_sql(s.bind, "SELECT id, nome, saldo_inicial FROM bancos ORDER BY nome")
-        if bancos.empty:
-            return pd.DataFrame(columns=["banco_id", "nome", "saldo_atual"])
-        ent = pd_read_sql(s.bind, f"""
-            SELECT banco_id, COALESCE(SUM(valor),0) AS total
-            FROM transacoes WHERE foi_pago={sql_bool(True)} AND tipo='Entrada' AND banco_id IS NOT NULL
-            GROUP BY banco_id
-        """)
-        sai = pd_read_sql(s.bind, f"""
-            SELECT banco_id, COALESCE(SUM(valor),0) AS total
-            FROM transacoes WHERE foi_pago={sql_bool(True)} AND tipo='Saida' AND banco_id IS NOT NULL
-            GROUP BY banco_id
-        """)
-        tin = pd_read_sql(s.bind, f"""
-            SELECT banco_destino_id AS banco_id, COALESCE(SUM(valor),0) AS total
-            FROM transferencias WHERE foi_executada={sql_bool(True)} GROUP BY banco_destino_id
-        """)
-        tout = pd_read_sql(s.bind, f"""
-            SELECT banco_origem_id AS banco_id, COALESCE(SUM(valor),0) AS total
-            FROM transferencias WHERE foi_executada={sql_bool(True)} GROUP BY banco_origem_id
-        """)
-
-        def get_total(df, bank_id):
-            if df.empty: return 0.0
-            r = df[df["banco_id"] == bank_id]
-            return float(r.iloc[0]["total"]) if not r.empty else 0.0
-
-        rows = []
-        for _, r in bancos.iterrows():
-            bid = int(r["id"]); saldo = float(r["saldo_inicial"])
-            saldo += get_total(ent, bid);  saldo -= get_total(sai, bid)
-            saldo += get_total(tin, bid);  saldo -= get_total(tout, bid)
-            rows.append({"banco_id": bid, "nome": r["nome"], "saldo_atual": round(saldo, 2)})
-        return pd.DataFrame(rows)
-
-# ===========================
-# Recibo (PDF)
-# ===========================
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas as pdfcanvas
-from reportlab.lib.units import mm
-
-def make_recibo_pdf(transacao: Transacao, session) -> bytes:
-    buffer = io.BytesIO()
-    c = pdfcanvas.Canvas(buffer, pagesize=A4)
-    W, H = A4; margin = 20*mm
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(margin, H-margin, "Recibo de Pagamento/Recebimento")
-    c.setFont("Helvetica", 10)
-    cat = session.get(Categoria, transacao.categoria_id)
-    sub = session.get(Subcategoria, transacao.subcategoria_id) if transacao.subcategoria_id else None
-    cc  = session.get(CentroCusto, transacao.centro_custo_id) if transacao.centro_custo_id else None
-    cli = session.get(Cliente, transacao.cliente_id) if transacao.cliente_id else None
-    forn= session.get(Fornecedor, transacao.fornecedor_id) if transacao.fornecedor_id else None
-    banco=session.get(Banco, transacao.banco_id) if transacao.banco_id else None
-    lines = [
-        f"ID Transação: {transacao.id}",
-        f"Tipo: {transacao.tipo}",
-        f"Categoria: {cat.nome if cat else ''} / {sub.nome if sub else ''}",
-        f"Centro de Custo: {cc.nome if cc else ''}",
-        f"Cliente: {cli.nome if cli else ''}",
-        f"Fornecedor: {forn.nome if forn else ''}",
-        f"Banco: {banco.nome if banco else ''}",
-        f"Valor: {money(transacao.valor)}",
-        f"Data Prevista: {transacao.data_prevista.strftime('%d/%m/%Y')}",
-        f"Pago? {'Sim' if transacao.foi_pago else 'Não'}",
-        f"Data Real: {transacao.data_real.strftime('%d/%m/%Y') if transacao.data_real else ''}",
-        f"Descrição: {transacao.descricao or ''}",
-    ]
-    y = H - margin - 28
-    for ln in lines:
-        c.drawString(margin, y, ln); y -= 14
-    c.line(margin, 40, W-margin, 40)
-    c.drawString(margin, 25, f"Emitido por {APP_TITLE} {APP_VERSION} em {datetime.now().strftime('%d/%m/%Y %H:%M')}")
-    c.showPage(); c.save(); buffer.seek(0)
-    return buffer.read()
-
-# ===========================
-# STREAMLIT
-# ===========================
-@st.cache_data(show_spinner=False)
-def df_query_cached(sql: str) -> pd.DataFrame:
-    return df_query(sql)
-
-def success(msg: str): st.toast(msg, icon="✅")
-def error(msg: str): st.toast(msg, icon="❌")
-
-# garantir dados mínimos
-ensure_seed_data()
-
-with st.sidebar:
-    st.title("💼 BK Gestão Financeira")
-    st.caption(APP_VERSION)
-    page = st.radio("Navegação", ["Home","Cadastro","Metas","Movimentações","Relatórios","Dashboards"], index=0, key="nav_page")
-    st.divider()
-
-st.markdown("""
+CUSTOM_CSS = """
 <style>
-.stButton>button {border-radius: 12px; padding: .6rem 1rem;}
-.stTextInput>div>div>input, .stNumberInput input, .stDateInput input, .stSelectbox div[data-baseweb="select"] {border-radius: 10px;}
-.metric-card {background:#f8f9fb; border-radius:16px; padding:18px; border:1px solid #edf0f4}
+body {
+    background: radial-gradient(circle at top, #111827 0, #020617 55%, #000 100%);
+    color: #e5e7eb;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+}
+
+.main-title {
+    font-size: 28px;
+    font-weight: 700;
+    color: #7c95d0;
+    margin-bottom: 0;
+}
+.main-subtitle {
+    font-size: 13px;
+    color: #9ca3af;
+}
+
+.bk-card {
+    background: linear-gradient(145deg, #0f172a 0%, #020617 40%, #030712 100%);
+    border-radius: 18px;
+    padding: 18px 22px;
+    color: #e5e7eb;
+    box-shadow: 0 20px 45px rgba(15,23,42,0.75);
+    border: 1px solid rgba(148,163,184,0.25);
+}
+
+/* BADGES / PILLS */
+
+.bk-section-title {
+    font-size: 14px;
+    text-transform: uppercase;
+    letter-spacing: .15em;
+    color: #9ca3af;
+    font-weight: 600;
+    margin-bottom: 10px;
+}
+
+.bk-pill {
+    border-radius: 999px;
+    padding: 2px 12px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.badge-rascunho { background: #374151; color: #e5e7eb; }
+.badge-em_aprovacao { background: #f97316; color: #111827; }
+.badge-aprovado { background: #22c55e; color: #022c22; }
+.badge-encerrado { background: #64748b; color: #020617; }
+
+/* REPORT CONTAINER */
+
+.bk-report {
+    background: radial-gradient(circle at top, #020617 0, #020617 30%, #020617 100%);
+    color: #e5e7eb;
+    border-radius: 18px;
+    padding: 26px 30px;
+    border: 1px solid rgba(148,163,184,0.35);
+    box-shadow: 0 24px 65px rgba(15,23,42,0.95);
+    position: relative;
+    overflow: hidden;
+}
+
+.bk-report::before {
+    content: "";
+    position: absolute;
+    inset: -40%;
+    background:
+        radial-gradient(circle at 0 0, rgba(56,189,248,0.12), transparent 50%),
+        radial-gradient(circle at 100% 0, rgba(249,115,22,0.12), transparent 55%),
+        radial-gradient(circle at 50% 100%, rgba(94,234,212,0.12), transparent 55%);
+    opacity: 0.8;
+    pointer-events: none;
+}
+
+.bk-report > * {
+    position: relative;
+    z-index: 1;
+}
+
+.bk-report h2 {
+    font-size: 22px;
+    margin-bottom: 4px;
+    color: #e5e7eb;
+}
+.bk-report h3 {
+    font-size: 16px;
+    margin-top: 18px;
+    margin-bottom: 6px;
+    color: #e5e7eb;
+}
+.bk-report small {
+    color: #9ca3af;
+    font-size: 11px;
+}
+.bk-report p {
+    font-size: 13px;
+    line-height: 1.5rem;
+}
+
+/* SECTION DIVIDER */
+
+.section-divider {
+    height: 1px;
+    width: 100%;
+    margin: 16px 0 12px 0;
+    border: 0;
+    background: linear-gradient(to right, transparent, #4b5563, transparent);
+}
+
+/* TABLE STYLE */
+
+.table-report {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    border-radius: 12px;
+    overflow: hidden;
+}
+.table-report thead tr {
+    background: linear-gradient(90deg, #020617, #020617);
+}
+.table-report th, .table-report td {
+    border: 1px solid #1f2937;
+    padding: 6px 8px;
+}
+.table-report th {
+    color: #e5e7eb;
+    text-align: left;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+}
+.table-report tr:nth-child(even) {
+    background: #020617;
+}
+.table-report tr:nth-child(odd) {
+    background: #030712;
+}
+
+/* TAGS / BADGES LIGHT */
+
+.tag-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-size: 11px;
+    border: 1px solid rgba(148,163,184,0.40);
+    background: linear-gradient(120deg, rgba(15,23,42,0.9), rgba(15,23,42,0.6));
+    color: #e5e7eb;
+}
+.tag-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 999px;
+    background: #22c55e;
+}
+.tag-dot.warn { background: #f97316; }
+.tag-dot.danger { background: #ef4444; }
+.tag-dot.info { background: #38bdf8; }
 </style>
-""", unsafe_allow_html=True)
+"""
 
-# ALTERAÇÃO FEITA
-# ---- Keys únicas por página / seção ----
-def uikey(name: str) -> str:
-    """Gera uma key única e estável por página."""
-    page = st.session_state.get("nav_page", "root")
-    return f"{page}:{name}"
-# FIM DA ALTERAÇÃO
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
-def input_id_to_edit_delete(df: pd.DataFrame, label="ID", key: str = None):
-    ids = [int(x) for x in (df["id"].tolist() if "id" in df.columns else [])]
-    if not ids:
-        st.info("Nenhum registro."); return None
-    return st.selectbox(label, ids, index=0, key=key)
+# --------------------------------------------------------
+# FUNÇÕES GERAIS
+# --------------------------------------------------------
 
-def load_obj(session, model, obj_id: int):
-    try:
-        return session.get(model, int(obj_id)) if obj_id is not None else None
-    except Exception:
-        return None
+def format_currency_br(val):
+    return f"R$ {val:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-# ===========================
-# Home
-# ===========================
-if page == "Home":
-    st.header("Visão Geral")
-
-    col1, col2, col3, col4 = st.columns(4)
-    with get_session() as s:
-        total_e = s.query(func.sum(Transacao.valor)).filter(
-            Transacao.tipo == "Entrada", Transacao.foi_pago == True
-        ).scalar() or 0
-        total_s = s.query(func.sum(Transacao.valor)).filter(
-            Transacao.tipo == "Saida", Transacao.foi_pago == True
-        ).scalar() or 0
-
-    with col1: st.metric("Entradas (Pagas)", money(total_e))
-    with col2: st.metric("Saídas (Pagas)",   money(total_s))
-    with col3: st.metric("Resultado",        money(total_e - total_s))
-    with col4:
-        dfb = compute_bank_balances()
-        tot = dfb["saldo_atual"].sum() if not dfb.empty else 0.0
-        st.metric("Saldo Total (Bancos)", money(tot))
-
-    st.subheader("Saldos por Banco")
-    dfb = compute_bank_balances()
-    if dfb.empty:
-        st.info("Cadastre bancos em **Cadastro > Bancos**.")
-    else:
-        st.dataframe(
-            dfb[["nome", "saldo_atual"]].rename(columns={"nome": "Banco", "saldo_atual": "Saldo Atual"}),
-            width='stretch',
-            key=uikey("home-saldos-bancos")
-        )
-
-    st.subheader("Próximos 30 dias — Fluxo Previsto")
-    with get_session() as s:
-        hoje = date.today(); fim = hoje + timedelta(days=30)
-        q = s.query(Transacao).filter(
-            Transacao.data_prevista >= hoje,
-            Transacao.data_prevista <= fim
-        ).order_by(Transacao.data_prevista)
-        df = pd.read_sql(q.statement, s.bind)
-    if df.empty:
-        st.info("Sem lançamentos previstos para os próximos 30 dias.")
-    else:
-        st.dataframe(
-            df[["id","tipo","valor","data_prevista","foi_pago","data_real","descricao"]],
-            width='stretch',
-            key=uikey("home-prox30")
-        )
-
-    st.subheader("Atrasados — Entradas/Saídas não pagas")
-    if _is_sqlite(DB_URL):
-        atrasados = df_query("""
-            SELECT t.id, t.tipo, c.nome AS categoria, s2.nome AS subcategoria, t.valor,
-                   t.data_prevista, cc.nome AS centro_custo,
-                   cli.nome AS cliente, f.nome AS fornecedor, b.nome AS banco, t.descricao,
-                   CAST(julianday('now') - julianday(t.data_prevista) AS INT) AS dias_atraso
-            FROM transacoes t
-            JOIN categorias c ON c.id=t.categoria_id
-            LEFT JOIN subcategorias s2 ON s2.id=t.subcategoria_id
-            LEFT JOIN centros_custo cc ON cc.id=t.centro_custo_id
-            LEFT JOIN clientes cli ON cli.id=t.cliente_id
-            LEFT JOIN fornecedores f ON f.id=t.fornecedor_id
-            LEFT JOIN bancos b ON b.id=t.banco_id
-            WHERE t.foi_pago=0 AND date(t.data_prevista) < date('now')
-            ORDER BY t.data_prevista ASC
-        """)
-    else:
-        atrasados = df_query(f"""
-            SELECT t.id, t.tipo, c.nome AS categoria, s2.nome AS subcategoria, t.valor,
-                   t.data_prevista, cc.nome AS centro_custo,
-                   cli.nome AS cliente, f.nome AS fornecedor, b.nome AS banco, t.descricao,
-                   (CURRENT_DATE - t.data_prevista) AS dias_atraso
-            FROM transacoes t
-            JOIN categorias c ON c.id=t.categoria_id
-            LEFT JOIN subcategorias s2 ON s2.id=t.subcategoria_id
-            LEFT JOIN centros_custo cc ON cc.id=t.centro_custo_id
-            LEFT JOIN clientes cli ON cli.id=t.cliente_id
-            LEFT JOIN fornecedores f ON f.id=t.fornecedor_id
-            LEFT JOIN bancos b ON b.id=t.banco_id
-            WHERE t.foi_pago={SQL_FALSE} AND DATE(t.data_prevista) < CURRENT_DATE
-            ORDER BY t.data_prevista ASC
-        """)
-
-    if atrasados.empty:
-        st.success("Não há lançamentos em atraso. 🎉")
-    else:
-        cE, cS = st.columns(2)
-        ent = atrasados[atrasados["tipo"] == "Entrada"].copy()
-        sai = atrasados[atrasados["tipo"] == "Saida"].copy()
-        with cE:
-            st.caption("Entradas em atraso")
-            st.dataframe(
-                ent[["id","categoria","subcategoria","cliente","valor","data_prevista","dias_atraso","descricao"]],
-                width='stretch',
-                key=uikey("home-atraso-ent")
-            )
-            st.metric("Total", money(ent["valor"].sum()))
-        with cS:
-            st.caption("Saídas em atraso")
-            st.dataframe(
-                sai[["id","categoria","subcategoria","fornecedor","valor","data_prevista","dias_atraso","descricao"]],
-                width='stretch',
-                key=uikey("home-atraso-sai")
-            )
-            st.metric("Total", money(sai["valor"].sum()))
-
-# ===========================
-# Cadastro
-# ===========================
-elif page == "Cadastro":
-    st.header("Cadastro")
-    tabs = st.tabs(["Clientes","Fornecedores","Bancos","Categorias","Subcategorias","Centros de Custo"])
-
-    # ---------- Clientes ----------
-    with tabs[0]:
-        st.subheader("Clientes — Incluir")
-        with st.form("form_cli_add", clear_on_submit=True):
-            c1,c2,c3,c4 = st.columns(4)
-            nome = c1.text_input("Nome", key="cli_add_nome")
-            doc = c2.text_input("Documento", key="cli_add_doc")
-            email = c3.text_input("E-mail", key="cli_add_email")
-            tel = c4.text_input("Telefone", key="cli_add_tel")
-            if st.form_submit_button("Adicionar Cliente") and nome:
-                with get_session() as s:
-                    if s.query(Cliente).filter_by(nome=nome).first(): error("Cliente já existe.")
-                    else:
-                        s.add(Cliente(nome=nome, documento=doc, email=email, telefone=tel))
-                        _done(s, "Cliente cadastrado.")
-        df_cli = df_query_cached("SELECT id, nome, documento, email, telefone, created_at FROM clientes ORDER BY id DESC")
-        st.dataframe(df_cli, width='stretch')
-        colE, colD = st.columns(2)
-        with colE:
-            st.markdown("**Editar Cliente**")
-            if df_cli.empty: st.info("Sem clientes.")
-            else:
-                edit_id = input_id_to_edit_delete(df_cli, "ID", key="cli_edit_id")
-                if edit_id:
-                    with get_session() as s:
-                        obj = load_obj(s, Cliente, edit_id)
-                        if obj:
-                            with st.form("form_cli_edit"):
-                                c1,c2,c3,c4 = st.columns(4)
-                                nome = c1.text_input("Nome", obj.nome, key="cli_edit_nome")
-                                doc = c2.text_input("Documento", obj.documento or "", key="cli_edit_doc")
-                                email = c3.text_input("E-mail", obj.email or "", key="cli_edit_email")
-                                tel = c4.text_input("Telefone", obj.telefone or "", key="cli_edit_tel")
-                                if st.form_submit_button("Salvar alterações"):
-                                    obj.nome, obj.documento, obj.email, obj.telefone = nome, doc, email, tel
-                                    _done(s, "Cliente atualizado.")
-        with colD:
-            st.markdown("**Excluir Cliente**")
-            if df_cli.empty: st.info("Sem clientes.")
-            else:
-                del_id = input_id_to_edit_delete(df_cli, "ID", key="cli_del_id")
-                if del_id and st.button("Excluir", type="primary", key="cli_del_btn"):
-                    with get_session() as s:
-                        obj = load_obj(s, Cliente, del_id)
-                        if obj:
-                            s.delete(obj); _done(s, "Cliente excluído.")
-
-    # ---------- Fornecedores ----------
-    with tabs[1]:
-        st.subheader("Fornecedores — Incluir")
-        with st.form("form_forn_add", clear_on_submit=True):
-            c1,c2,c3,c4 = st.columns(4)
-            nome = c1.text_input("Nome", key="forn_add_nome"); doc = c2.text_input("Documento", key="forn_add_doc")
-            email = c3.text_input("E-mail", key="forn_add_email"); tel = c4.text_input("Telefone", key="forn_add_tel")
-            if st.form_submit_button("Adicionar Fornecedor") and nome:
-                with get_session() as s:
-                    if s.query(Fornecedor).filter_by(nome=nome).first(): error("Fornecedor já existe.")
-                    else:
-                        s.add(Fornecedor(nome=nome, documento=doc, email=email, telefone=tel))
-                        _done(s, "Fornecedor cadastrado.")
-        df_f = df_query_cached("SELECT id, nome, documento, email, telefone, created_at FROM fornecedores ORDER BY id DESC")
-        st.dataframe(df_f, width='stretch')
-        colE, colD = st.columns(2)
-        with colE:
-            st.markdown("**Editar Fornecedor**")
-            if df_f.empty: st.info("Sem fornecedores.")
-            else:
-                edit_id = input_id_to_edit_delete(df_f, "ID", key="forn_edit_id")
-                if edit_id:
-                    with get_session() as s:
-                        obj = load_obj(s, Fornecedor, edit_id)
-                        if obj:
-                            with st.form("form_forn_edit"):
-                                c1, c2, c3, c4 = st.columns(4)
-                                nome = c1.text_input("Nome", obj.nome, key="forn_edit_nome")
-                                doc = c2.text_input("Documento", obj.documento or "", key="forn_edit_doc")
-                                email = c3.text_input("E-mail", obj.email or "", key="forn_edit_email")
-                                tel = c4.text_input("Telefone", obj.telefone or "", key="forn_edit_tel")
-                                if st.form_submit_button("Salvar alterações"):
-                                    obj.nome, obj.documento, obj.email, obj.telefone = nome, doc, email, tel
-                                    _done(s, "Fornecedor atualizado.")
-        with colD:
-            st.markdown("**Excluir Fornecedor**")
-            if df_f.empty: st.info("Sem fornecedores.")
-            else:
-                del_id = input_id_to_edit_delete(df_f, "ID", key="forn_del_id")
-                if del_id and st.button("Excluir fornecedor", key="forn_del_btn"):
-                    with get_session() as s:
-                        obj = load_obj(s, Fornecedor, del_id)
-                        if obj:
-                            s.delete(obj); _done(s, "Fornecedor excluído.")
-
-    # ---------- Bancos ----------
-    with tabs[2]:
-        st.subheader("Bancos — Incluir")
-        with st.form("form_banco_add", clear_on_submit=True):
-            c1, c2 = st.columns(2)
-            nome = c1.text_input("Nome do banco", key="bco_add_nome")
-            saldo = c2.number_input("Saldo inicial", min_value=0.0, step=100.0, format="%.2f", key="bco_add_saldo")
-            if st.form_submit_button("Adicionar Banco") and nome:
-                with get_session() as s:
-                    if s.query(Banco).filter_by(nome=nome).first(): error("Banco já existe.")
-                    else:
-                        s.add(Banco(nome=nome, saldo_inicial=float(saldo)))
-                        _done(s, "Banco cadastrado.")
-        df_b = df_query_cached("SELECT id, nome, saldo_inicial, created_at FROM bancos ORDER BY id DESC")
-        st.dataframe(df_b, width='stretch')
-        colE, colD = st.columns(2)
-        with colE:
-            st.markdown("**Editar Banco**")
-            if df_b.empty: st.info("Sem bancos.")
-            else:
-                edit_id = input_id_to_edit_delete(df_b, "ID", key="bco_edit_id")
-                if edit_id:
-                    with get_session() as s:
-                        obj = load_obj(s, Banco, edit_id)
-                        if obj:
-                            with st.form("form_banco_edit"):
-                                c1, c2 = st.columns(2)
-                                nome = c1.text_input("Nome", obj.nome, key="bco_edit_nome")
-                                saldo = c2.number_input("Saldo inicial", min_value=0.0, step=100.0, format="%.2f", value=float(obj.saldo_inicial or 0), key="bco_edit_saldo")
-                                if st.form_submit_button("Salvar alterações"):
-                                    obj.nome, obj.saldo_inicial = nome, float(saldo)
-                                    _done(s, "Banco atualizado.")
-        with colD:
-            st.markdown("**Excluir Banco**")
-            if df_b.empty: st.info("Sem bancos.")
-            else:
-                del_id = input_id_to_edit_delete(df_b, "ID", key="bco_del_id")
-                if del_id and st.button("Excluir banco", key="bco_del_btn"):
-                    with get_session() as s:
-                        obj = load_obj(s, Banco, del_id)
-                        if obj:
-                            s.delete(obj); _done(s, "Banco excluído.")
-
-    # ---------- Categorias ----------
-    with tabs[3]:
-        st.subheader("Categorias — Incluir")
-        cat_add_tipo = st.selectbox("Tipo (para a nova categoria)", ["Entrada", "Saida"], key="cat_add_tipo_live")
-        with get_session() as s:
-            nomes_exist = pd_read_sql(
-                s.bind,
-                "SELECT DISTINCT nome FROM categorias WHERE tipo=:t ORDER BY nome",
-                params={"t": cat_add_tipo}
-            )
-        sugestoes = nomes_exist["nome"].tolist() if not nomes_exist.empty else []
-        with st.form("form_cat_add", clear_on_submit=True):
-            c1, c2 = st.columns(2)
-            c1.markdown(f"**Tipo selecionado:** `{cat_add_tipo}`")
-            nome_sel = c2.selectbox("Nome da categoria", options=(["- digite novo -"] + sugestoes), key="cat_add_nome_sel")
-            nome_txt = c2.text_input("Novo nome", key="cat_add_nome_txt") if nome_sel == "- digite novo -" else nome_sel
-            if st.form_submit_button("Adicionar Categoria"):
-                nome_final = (nome_txt or "").strip()
-                if not nome_final:
-                    error("Informe o nome da categoria.")
-                else:
-                    with get_session() as s:
-                        s.add(Categoria(tipo=cat_add_tipo, nome=nome_final))
-                        _done(s, "Categoria cadastrada.")
-        df_c = df_query_cached("SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome")
-        st.dataframe(df_c, width='stretch')
-        colE, colD = st.columns(2)
-        with colE:
-            st.markdown("**Editar Categoria**")
-            if df_c.empty: st.info("Sem categorias.")
-            else:
-                edit_id = input_id_to_edit_delete(df_c, "ID", key="cat_edit_id")
-                if edit_id:
-                    with get_session() as s:
-                        obj = load_obj(s, Categoria, edit_id)
-                        if obj:
-                            with st.form("form_cat_edit"):
-                                c1, c2 = st.columns(2)
-                                tipo = c1.selectbox("Tipo", ["Entrada", "Saida"], index=0 if obj.tipo == "Entrada" else 1, key="cat_edit_tipo")
-                                nomes_exist = pd_read_sql(s.bind, "SELECT DISTINCT nome FROM categorias WHERE tipo=:t ORDER BY nome", params={"t": tipo})
-                                sugestoes = nomes_exist["nome"].tolist() if not nomes_exist.empty else []
-                                cur = obj.nome if obj.nome not in sugestoes else None
-                                nome = c2.selectbox(
-                                    "Nome",
-                                    options=(sugestoes + (["- digite novo -"] if cur or not sugestoes else [])),
-                                    index=(sugestoes.index(obj.nome) if obj.nome in sugestoes else len(sugestoes)),
-                                    key="cat_edit_nome_sel"
-                                )
-                                if nome == "- digite novo -" or cur:
-                                    nome = c2.text_input("Novo nome", value=(cur or ""), key="cat_edit_nome_txt")
-                                if st.form_submit_button("Salvar alterações"):
-                                    obj.tipo, obj.nome = tipo, (nome or "").strip()
-                                    _done(s, "Categoria atualizada.")
-        with colD:
-            st.markdown("**Excluir Categoria**")
-            if df_c.empty: st.info("Sem categorias.")
-            else:
-                del_id = input_id_to_edit_delete(df_c, "ID", key="cat_del_id")
-                if del_id and st.button("Excluir categoria", key="cat_del_btn"):
-                    with get_session() as s:
-                        obj = load_obj(s, Categoria, del_id)
-                        if obj:
-                            s.delete(obj); _done(s, "Categoria excluída.")
-
-    # ---------- Subcategorias ----------
-    with tabs[4]:
-        st.subheader("Subcategorias — Incluir")
-        sub_add_tipo = st.selectbox("Tipo (para a nova subcategoria)", ["Entrada", "Saida"], key="sub_add_tipo_live")
-        with get_session() as s:
-            cats = pd_read_sql(s.bind, "SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome")
-        cats_tipo = cats[cats["tipo"] == sub_add_tipo]
-        cat_opts_add = [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _, r in cats_tipo.iterrows()]
-        if not cat_opts_add:
-            st.info("Cadastre uma categoria do tipo selecionado primeiro.")
-        else:
-            default_cat_id = extract_id(cat_opts_add[0])
-            with get_session() as s:
-                nomes_exist = pd_read_sql(
-                    s.bind,
-                    "SELECT DISTINCT nome FROM subcategorias WHERE categoria_id=:c ORDER BY nome",
-                    params={"c": default_cat_id}
-                )
-            sugestoes_default = nomes_exist["nome"].tolist() if not nomes_exist.empty else []
-            with st.form("form_sub_add", clear_on_submit=True):
-                c1, c2 = st.columns(2)
-                cat_opt = c1.selectbox("Categoria", cat_opts_add, key="sub_add_cat")
-                with get_session() as s:
-                    nomes_exist2 = pd_read_sql(
-                        s.bind,
-                        "SELECT DISTINCT nome FROM subcategorias WHERE categoria_id=:c ORDER BY nome",
-                        params={"c": extract_id(cat_opt)}
-                    )
-                sugestoes = nomes_exist2["nome"].tolist() if not nomes_exist2.empty else sugestoes_default
-                nome_sel = c2.selectbox("Nome da subcategoria", ["- digite novo -"] + sugestoes, key="sub_add_nome_sel")
-                nome = c2.text_input("Novo nome", key="sub_add_nome_txt") if nome_sel == "- digite novo -" else nome_sel
-                if st.form_submit_button("Adicionar Subcategoria") and (nome or "").strip():
-                    cat_id = extract_id(cat_opt)
-                    with get_session() as s:
-                        s.add(Subcategoria(categoria_id=cat_id, nome=(nome or "").strip()))
-                        _done(s, "Subcategoria cadastrada.")
-        df_sc = df_query_cached("""
-            SELECT s.id, c.tipo, c.nome AS categoria, s.nome AS subcategoria
-            FROM subcategorias s JOIN categorias c ON c.id=s.categoria_id
-            ORDER BY c.tipo, c.nome, s.nome
-        """)
-        st.dataframe(df_sc, width='stretch')
-        colE, colD = st.columns(2)
-        with colE:
-            st.markdown("**Editar Subcategoria**")
-            if df_sc.empty: st.info("Sem subcategorias.")
-            else:
-                edit_id = input_id_to_edit_delete(df_sc, "ID", key="sub_edit_id")
-                if edit_id:
-                    with get_session() as s:
-                        obj = load_obj(s, Subcategoria, edit_id)
-                        cats = pd_read_sql(s.bind, "SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome")
-                        if obj:
-                            with st.form("form_sub_edit"):
-                                c1, c2 = st.columns(2)
-                                tipo_sel = c1.selectbox("Tipo", ["Entrada", "Saida"], index=0 if s.get(Categoria, obj.categoria_id).tipo == "Entrada" else 1, key="sub_edit_tipo")
-                                cats_tipo = cats[cats["tipo"] == tipo_sel]
-                                cat_obj = s.get(Categoria, obj.categoria_id)
-                                cat_label_cur = f"{cat_obj.tipo} - {cat_obj.nome} (# {cat_obj.id})" if cat_obj else "-"
-                                opts = [cat_label_cur] + [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _, r in cats_tipo.iterrows() if f"{r['tipo']} - {r['nome']} (# {r['id']})" != cat_label_cur]
-                                escolha = c1.selectbox("Categoria", opts, key="sub_edit_cat")
-                                new_cat_id = extract_id(escolha) or obj.categoria_id
-                                nomes_exist = pd_read_sql(s.bind, "SELECT DISTINCT nome FROM subcategorias WHERE categoria_id=:c ORDER BY nome", params={"c": new_cat_id})
-                                sugestoes = nomes_exist["nome"].tolist() if not nomes_exist.empty else []
-                                nome_sel = c2.selectbox("Nome", (sugestoes + ["- digite novo -"]), index=(sugestoes.index(obj.nome) if obj.nome in sugestoes else len(sugestoes)), key="sub_edit_nome_sel")
-                                nome = c2.text_input("Novo nome", value=(obj.nome if nome_sel == "- digite novo -" else ""), key="sub_edit_nome_txt") if nome_sel == "- digite novo -" else nome_sel
-                                if st.form_submit_button("Salvar alterações"):
-                                    obj.categoria_id = new_cat_id
-                                    obj.nome = (nome or "").strip()
-                                    _done(s, "Subcategoria atualizada.")
-        with colD:
-            st.markdown("**Excluir Subcategoria**")
-            if df_sc.empty: st.info("Sem subcategorias.")
-            else:
-                del_id = input_id_to_edit_delete(df_sc, "ID", key="sub_del_id")
-                if del_id and st.button("Excluir subcategoria", key="sub_del_btn"):
-                    with get_session() as s:
-                        obj = load_obj(s, Subcategoria, del_id)
-                        if obj:
-                            s.delete(obj); _done(s, "Subcategoria excluída.")
-
-    # ---------- Centros de Custo ----------
-    with tabs[5]:
-        st.subheader("Centros de Custo — Incluir")
-        with st.form("form_cc_add", clear_on_submit=True):
-            c1, c2 = st.columns(2)
-            nome = c1.text_input("Nome do centro de custo", key="cc_add_nome")
-            desc = c2.text_input("Descrição", key="cc_add_desc")
-            if st.form_submit_button("Adicionar Centro de Custo") and nome:
-                with get_session() as s:
-                    if s.query(CentroCusto).filter_by(nome=nome).first(): error("Centro de custo já existe.")
-                    else:
-                        s.add(CentroCusto(nome=nome, descricao=desc))
-                        _done(s, "Centro de custo cadastrado.")
-        df_cc = df_query_cached("SELECT id, nome, descricao FROM centros_custo ORDER BY nome")
-        st.dataframe(df_cc, width='stretch')
-        colE, colD = st.columns(2)
-        with colE:
-            st.markdown("**Editar Centro de Custo**")
-            if df_cc.empty: st.info("Sem centros de custo.")
-            else:
-                edit_id = input_id_to_edit_delete(df_cc, "ID", key="cc_edit_id")
-                if edit_id:
-                    with get_session() as s:
-                        obj = load_obj(s, CentroCusto, edit_id)
-                        if obj:
-                            with st.form("form_cc_edit"):
-                                c1, c2 = st.columns(2)
-                                nome = c1.text_input("Nome", obj.nome, key="cc_edit_nome")
-                                desc = c2.text_input("Descrição", obj.descricao or "", key="cc_edit_desc")
-                                if st.form_submit_button("Salvar alterações"):
-                                    obj.nome, obj.descricao = nome, desc
-                                    _done(s, "Centro de custo atualizado.")
-        with colD:
-            st.markdown("**Excluir Centro de Custo**")
-            if df_cc.empty: st.info("Sem centros de custo.")
-            else:
-                del_id = input_id_to_edit_delete(df_cc, "ID", key="cc_del_id")
-                if del_id and st.button("Excluir centro de custo", key="cc_del_btn"):
-                    with get_session() as s:
-                        obj = load_obj(s, CentroCusto, del_id)
-                        if obj:
-                            s.delete(obj); _done(s, "Centro de custo excluído.")
-
-# ===========================
-# Metas
-# ===========================
-elif page == "Metas":
-    st.header("Metas (Previsões)")
-    with get_session() as s:
-        cats = pd_read_sql(s.bind, "SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome")
-        subs = pd_read_sql(s.bind, "SELECT id, categoria_id, nome FROM subcategorias")
-    colf = st.columns(4)
-    ano = colf[0].number_input("Ano", min_value=2000, max_value=2100, value=date.today().year, key="meta_ano")
-    mes = colf[1].number_input("Mês", min_value=1, max_value=12, value=date.today().month, key="meta_mes")
-    cat_opt = colf[2].selectbox("Categoria", ["-"] + [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _, r in cats.iterrows()], key="meta_cat")
-    valor_prev = colf[3].number_input("Valor Previsto (R$)", min_value=0.0, step=100.0, format="%.2f", key="meta_valor_prev")
-    if cat_opt == "-":
-        st.info("Selecione uma categoria para lançar metas.")
-    else:
-        cat_id = extract_id(cat_opt)
-        subs_cat = subs[subs["categoria_id"] == cat_id]
-        sub_opt = st.selectbox("Subcategoria", ["-"] + [f"{r['nome']} (# {r['id']})" for _, r in subs_cat.iterrows()], key="meta_sub")
-        if st.button("Salvar Meta", key="meta_save"):
-            with get_session() as s:
-                s.add(Meta(
-                    ano=int(ano), mes=int(mes),
-                    categoria_id=cat_id,
-                    subcategoria_id=extract_id(sub_opt) if sub_opt != "-" else None,
-                    valor_previsto=float(valor_prev),
-                ))
-                _done(s, "Meta salva.")
-    st.subheader("Metas do mês")
-    with get_session() as s:
-        dfm = pd_read_sql(s.bind, """
-            SELECT m.id, m.ano, m.mes, c.tipo, c.nome as categoria, s2.nome as subcategoria, m.valor_previsto
-            FROM metas m
-            JOIN categorias c ON c.id=m.categoria_id
-            LEFT JOIN subcategorias s2 ON s2.id=m.subcategoria_id
-            WHERE m.ano=:ano AND m.mes=:mes
-            ORDER BY c.tipo, categoria, subcategoria
-        """, params={"ano": int(ano), "mes": int(mes)})
-    st.dataframe(dfm, width='stretch')
-    colE, colD = st.columns(2)
-    with colE:
-        st.markdown("**Editar Meta**")
-        if dfm.empty: st.info("Sem metas para o período.")
-        else:
-            edit_id = input_id_to_edit_delete(dfm, "ID", key="meta_edit_id")
-            if edit_id:
-                with get_session() as s:
-                    obj = load_obj(s, Meta, edit_id)
-                    if obj:
-                        with st.form("form_meta_edit"):
-                            c1, c2, c3 = st.columns(3)
-                            ano_n = c1.number_input("Ano", 2000, 2100, value=int(obj.ano), key="meta_edit_ano")
-                            mes_n = c2.number_input("Mês", 1, 12, value=int(obj.mes), key="meta_edit_mes")
-                            valor = c3.number_input("Valor Previsto", min_value=0.0, step=100.0, format="%.2f", value=float(obj.valor_previsto or 0), key="meta_edit_valor")
-                            cats = pd_read_sql(s.bind, "SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome")
-                            cat_obj = s.get(Categoria, obj.categoria_id)
-                            cat_label = f"{cat_obj.tipo} - {cat_obj.nome} (# {obj.categoria_id})" if cat_obj else "-"
-                            categoria = st.selectbox("Categoria", [cat_label] + [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _, r in cats.iterrows()], key="meta_edit_cat")
-                            sub_opt_list = pd_read_sql(
-                                s.bind, "SELECT id, nome FROM subcategorias WHERE categoria_id = :c",
-                                params={"c": (extract_id(categoria) or obj.categoria_id)},
-                            )
-                            sub_label = ""
-                            if obj.subcategoria_id:
-                                sc = s.get(Subcategoria, obj.subcategoria_id)
-                                if sc: sub_label = f"{sc.nome} (# {sc.id})"
-                            subcat = st.selectbox("Subcategoria", ["-"] + ([sub_label] if sub_label else []) + [f"{r['nome']} (# {r['id']})" for _, r in sub_opt_list.iterrows()], key="meta_edit_sub")
-                            if st.form_submit_button("Salvar alterações"):
-                                obj.ano, obj.mes = int(ano_n), int(mes_n)
-                                obj.categoria_id = extract_id(categoria) or obj.categoria_id
-                                obj.subcategoria_id = extract_id(subcat) if subcat and subcat != "-" else None
-                                obj.valor_previsto = float(valor)
-                                _done(s, "Meta atualizada.")
-    with colD:
-        st.markdown("**Excluir Meta**")
-        if dfm.empty: st.info("Sem metas.")
-        else:
-            del_id = input_id_to_edit_delete(dfm, "ID", key="meta_del_id")
-            if del_id and st.button("Excluir meta", key="meta_del_btn"):
-                with get_session() as s:
-                    obj = load_obj(s, Meta, del_id)
-                    if obj:
-                        s.delete(obj); _done(s, "Meta excluída.")
-
-# ===========================
-# Movimentações
-# ===========================
-elif page == "Movimentações":
-    st.header("Movimentações")
-    tabs = st.tabs(["Lançamentos", "Transferências entre bancos"])
-
-    # --------- Lançamentos (ADD) ---------
-    with tabs[0]:
-        with get_session() as s:
-            df_cat_all = pd_read_sql(s.bind, "SELECT id, tipo, nome FROM categorias ORDER BY tipo, nome")
-            df_sub_all = pd_read_sql(s.bind, "SELECT id, categoria_id, nome FROM subcategorias ORDER BY nome")
-            df_cc_all  = pd_read_sql(s.bind, "SELECT id, nome FROM centros_custo ORDER BY nome")
-            df_cli_all = pd_read_sql(s.bind, "SELECT id, nome FROM clientes ORDER BY nome")
-            df_forn_all= pd_read_sql(s.bind, "SELECT id, nome FROM fornecedores ORDER BY nome")
-            df_bco_all = pd_read_sql(s.bind, "SELECT id, nome FROM bancos ORDER BY nome")
-
-        st.subheader("Incluir Lançamento")
-        tipo_add = st.selectbox("Tipo do lançamento", ["Entrada", "Saida"], key="tx_add_tipo_live")
-        cat_rows = df_cat_all[df_cat_all["tipo"] == tipo_add]
-        cat_opts = [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _, r in cat_rows.iterrows()]
-        default_cat_id = extract_id(cat_opts[0]) if cat_opts else None
-        sub_rows_default = df_sub_all[df_sub_all["categoria_id"] == (default_cat_id or -1)]
-        sub_opts_default = ["-"] + [f"{r['nome']} (# {r['id']})" for _, r in sub_rows_default.iterrows()]
-
-        with st.form("form_tx_add", clear_on_submit=True):
-            c1, c2, c3, c4 = st.columns(4)
-            cat_add  = c2.selectbox("Categoria", cat_opts, placeholder="Selecione", key="tx_add_cat")
-            cat_id_add = extract_id(cat_add) if cat_add else default_cat_id
-            sub_rows = df_sub_all[df_sub_all["categoria_id"] == (cat_id_add or -1)]
-            sub_opts = ["-"] + [f"{r['nome']} (# {r['id']})" for _, r in sub_rows.iterrows()]
-            sub_add  = c3.selectbox("Subcategoria", sub_opts if sub_opts else sub_opts_default, key="tx_add_sub")
-            valor_add = c4.number_input("Valor (R$)", min_value=0.0, step=100.0, format="%.2f", key="tx_add_valor")
-            c1.markdown(f"**Tipo selecionado:** `{tipo_add}`")
-
-            d1, d2, d3, d4 = st.columns(4)
-            data_prev_add = d1.date_input("Data Prevista", value=date.today(), key="tx_add_data_prev")
-            pago_add      = d2.checkbox("Pago?", key="tx_add_pago")
-            data_real_add = d3.date_input("Data Real", value=date.today(), key="tx_add_data_real") if pago_add else None
-            bco_opts = ["-"] + [f"{r['nome']} (# {r['id']})" for _, r in df_bco_all.iterrows()]
-            bco_add  = d4.selectbox("Banco", bco_opts, key="tx_add_banco")
-
-            e1, e2, e3 = st.columns(3)
-            cc_opts   = ["-"] + [f"{r['nome']} (# {r['id']})" for _, r in df_cc_all.iterrows()]
-            cc_add    = e1.selectbox("Centro de Custo", cc_opts, key="tx_add_cc")
-            cli_opts  = ["-"] + [f"{r['nome']} (# {r['id']})" for _, r in df_cli_all.iterrows()]
-            forn_opts = ["-"] + [f"{r['nome']} (# {r['id']})" for _, r in df_forn_all.iterrows()]
-            cli_add   = e2.selectbox("Cliente (Entrada)", cli_opts, key="tx_add_cli")
-            forn_add  = e3.selectbox("Fornecedor (Saída)", forn_opts, key="tx_add_forn")
-
-            desc_add = st.text_area("Descrição", key="tx_add_desc")
-
-            st.markdown("**Recorrência**")
-            r1, r2, r3 = st.columns(3)
-            recorr_add = r1.selectbox("Tipo", ["Unica", "Mensal", "Anual", "Parcelado"], key="tx_add_rec")
-            parcelas_total_add = None
-            periodicidade_add = "Mensal"
-            if recorr_add == "Parcelado":
-                parcelas_total_add = r2.number_input("Nº de parcelas", min_value=1, max_value=120, value=2, key="tx_add_parc_n")
-                periodicidade_add = r3.selectbox("Periodicidade", ["Mensal", "Anual"], key="tx_add_parc_per")
-
-            if st.form_submit_button("Lançar"):
-                if not cat_id_add:
-                    error("Selecione a categoria."); st.stop()
-                with get_session() as s:
-                    def add_tx(idx: Optional[int], dt: date):
-                        t = Transacao(
-                            tipo=tipo_add,
-                            categoria_id=cat_id_add,
-                            subcategoria_id=extract_id(sub_add) if sub_add and sub_add != "-" else None,
-                            valor=float(valor_add or 0),
-                            data_prevista=dt,
-                            foi_pago=bool(pago_add),
-                            data_real=(data_real_add if pago_add else None),
-                            centro_custo_id=extract_id(cc_add) if cc_add and cc_add != "-" else None,
-                            cliente_id=extract_id(cli_add) if (tipo_add == "Entrada" and cli_add != "-") else None,
-                            fornecedor_id=extract_id(forn_add) if (tipo_add == "Saida" and forn_add != "-") else None,
-                            banco_id=extract_id(bco_add) if bco_add and bco_add != "-" else None,
-                            descricao=desc_add or "",
-                            recorrencia=recorr_add,
-                            parcelas_total=int(parcelas_total_add) if parcelas_total_add else None,
-                            parcela_index=idx if parcelas_total_add else None,
-                        )
-                        s.add(t)
-
-                    if recorr_add == "Unica":
-                        add_tx(None, data_prev_add)
-                    elif recorr_add in ("Mensal", "Anual"):
-                        steps = 12 if recorr_add == "Mensal" else 5
-                        for i in range(steps):
-                            dt = data_prev_add + (relativedelta(months=i) if recorr_add == "Mensal" else relativedelta(years=i))
-                            add_tx(None, dt)
-                    elif recorr_add == "Parcelado":
-                        total = int(parcelas_total_add or 1)
-                        for i in range(1, total + 1):
-                            dt = data_prev_add + (relativedelta(months=i - 1) if periodicidade_add == "Mensal" else relativedelta(years=i - 1))
-                            add_tx(i, dt)
-                    _done(s, "Movimentação(ões) lançada(s).")
-
-        # Lista + Editar/Excluir
-        st.subheader("Lançamentos — Lista")
-        with get_session() as s:
-            df_tx = pd_read_sql(s.bind, """
-                SELECT t.id, t.tipo, c.nome AS categoria, s2.nome AS subcategoria, t.valor,
-                       t.data_prevista, t.foi_pago, t.data_real,
-                       cc.nome AS centro_custo, cli.nome AS cliente, f.nome AS fornecedor, b.nome AS banco, t.descricao
-                FROM transacoes t
-                JOIN categorias c ON c.id = t.categoria_id
-                LEFT JOIN subcategorias s2 ON s2.id = t.subcategoria_id
-                LEFT JOIN centros_custo cc ON cc.id = t.centro_custo_id
-                LEFT JOIN clientes cli ON cli.id = t.cliente_id
-                LEFT JOIN fornecedores f ON f.id = t.fornecedor_id
-                LEFT JOIN bancos b ON b.id = t.banco_id
-                ORDER BY t.data_prevista DESC, t.id DESC
-            """)
-        st.dataframe(df_tx, width='stretch')
-
-        colE, colD = st.columns(2)
-        # Editar
-        with colE:
-            st.markdown("**Editar Lançamento**")
-            if df_tx.empty:
-                st.info("Sem lançamentos.")
-            else:
-                edit_id = input_id_to_edit_delete(df_tx, "ID", key="tx_edit_id")
-                if edit_id:
-                    with get_session() as s:
-                        t = load_obj(s, Transacao, edit_id)
-                        if t:
-                            with st.form("form_tx_edit"):
-                                c1, c2, c3, c4 = st.columns(4)
-                                tipo_ed = c1.selectbox("Tipo", ["Entrada", "Saida"], index=0 if t.tipo == "Entrada" else 1, key="tx_edit_tipo")
-                                df_cat_typ = pd_read_sql(
-                                    s.bind, "SELECT id, tipo, nome FROM categorias WHERE tipo=:tp ORDER BY nome",
-                                    params={"tp": tipo_ed},
-                                )
-                                cat_cur = s.get(Categoria, t.categoria_id)
-                                cat_label_cur = f"{cat_cur.tipo} - {cat_cur.nome} (# {cat_cur.id})" if cat_cur else "-"
-                                cat_opts_ed = [cat_label_cur] + [f"{r['tipo']} - {r['nome']} (# {r['id']})" for _, r in df_cat_typ.iterrows() if f"{r['tipo']} - {r['nome']} (# {r['id']})" != cat_label_cur]
-                                cat_ed = c2.selectbox("Categoria", cat_opts_ed, key="tx_edit_cat")
-
-                                cat_id_sel = extract_id(cat_ed) or t.categoria_id
-                                df_sub_typ = pd_read_sql(
-                                    s.bind, "SELECT id, nome FROM subcategorias WHERE categoria_id=:c ORDER BY nome",
-                                    params={"c": cat_id_sel},
-                                )
-                                sub_label_cur = "-"
-                                if t.subcategoria_id:
-                                    sc = s.get(Subcategoria, t.subcategoria_id)
-                                    if sc: sub_label_cur = f"{sc.nome} (# {sc.id})"
-                                sub_opts_ed = ["-"] + ([sub_label_cur] if sub_label_cur != "-" else []) + [f"{r['nome']} (# {r['id']})" for _, r in df_sub_typ.iterrows() if f"{r['nome']} (# {r['id']})" != sub_label_cur]
-                                sub_ed = c3.selectbox("Subcategoria", sub_opts_ed, key="tx_edit_sub")
-
-                                valor_ed = c4.number_input("Valor (R$)", min_value=0.0, step=100.0, format="%.2f", value=float(t.valor or 0), key="tx_edit_valor")
-
-                                d1, d2, d3, d4 = st.columns(4)
-                                data_prev_ed = d1.date_input("Data Prevista", value=t.data_prevista, key="tx_edit_data_prev")
-                                pago_ed      = d2.checkbox("Pago?", value=bool(t.foi_pago), key="tx_edit_pago")
-                                data_real_ed = d3.date_input("Data Real", value=t.data_real or date.today(), key="tx_edit_data_real") if pago_ed else None
-
-                                df_bco = pd_read_sql(s.bind, "SELECT id, nome FROM bancos ORDER BY nome")
-                                bco_label_cur = "-"
-                                if t.banco_id:
-                                    bco_cur = s.get(Banco, t.banco_id)
-                                    if bco_cur: bco_label_cur = f"{bco_cur.nome} (# {bco_cur.id})"
-                                bco_opts_ed = [bco_label_cur] + [f"{r['nome']} (# {r['id']})" for _, r in df_bco.iterrows() if f"{r['nome']} (# {r['id']})" != bco_label_cur]
-                                bco_ed = d4.selectbox("Banco", bco_opts_ed, key="tx_edit_banco")
-
-                                e1, e2, e3 = st.columns(3)
-                                df_cc = pd_read_sql(s.bind, "SELECT id, nome FROM centros_custo ORDER BY nome")
-                                cc_label_cur = "-"
-                                if t.centro_custo_id:
-                                    cc_cur = s.get(CentroCusto, t.centro_custo_id)
-                                    if cc_cur: cc_label_cur = f"{cc_cur.nome} (# {cc_cur.id})"
-                                cc_opts_ed = [cc_label_cur] + [f"{r['nome']} (# {r['id']})" for _, r in df_cc.iterrows() if f"{r['nome']} (# {r['id']})" != cc_label_cur]
-                                cc_ed = e1.selectbox("Centro de Custo", cc_opts_ed, key="tx_edit_cc")
-
-                                df_cli = pd_read_sql(s.bind, "SELECT id, nome FROM clientes ORDER BY nome")
-                                cli_label_cur = "-"
-                                if t.cliente_id:
-                                    cli_cur = s.get(Cliente, t.cliente_id)
-                                    if cli_cur: cli_label_cur = f"{cli_cur.nome} (# {cli_cur.id})"
-                                cli_opts_ed = [cli_label_cur] + [f"{r['nome']} (# {r['id']})" for _, r in df_cli.iterrows() if f"{r['nome']} (# {r['id']})" != cli_label_cur]
-                                cli_ed = e2.selectbox("Cliente (Entrada)", cli_opts_ed, key="tx_edit_cli")
-
-                                df_forn = pd_read_sql(s.bind, "SELECT id, nome FROM fornecedores ORDER BY nome")
-                                forn_label_cur = "-"
-                                if t.fornecedor_id:
-                                    f_cur = s.get(Fornecedor, t.fornecedor_id)
-                                    if f_cur: forn_label_cur = f"{f_cur.nome} (# {f_cur.id})"
-                                forn_opts_ed = [forn_label_cur] + [f"{r['nome']} (# {r['id']})" for _, r in df_forn.iterrows() if f"{r['nome']} (# {r['id']})" != forn_label_cur]
-                                forn_ed = e3.selectbox("Fornecedor (Saída)", forn_opts_ed, key="tx_edit_forn")
-
-                                desc_ed = st.text_area("Descrição", t.descricao or "", key="tx_edit_desc")
-
-                                if st.form_submit_button("Salvar alterações"):
-                                    t.tipo = tipo_ed
-                                    t.categoria_id = extract_id(cat_ed) or t.categoria_id
-                                    t.subcategoria_id = extract_id(sub_ed) if sub_ed and sub_ed != "-" else None
-                                    t.valor = float(valor_ed)
-                                    t.data_prevista = data_prev_ed
-                                    t.foi_pago = bool(pago_ed)
-                                    t.data_real = (data_real_ed if pago_ed else None)
-                                    t.banco_id = extract_id(bco_ed) if bco_ed and bco_ed != "-" else None
-                                    t.centro_custo_id = extract_id(cc_ed) if cc_ed and cc_ed != "-" else None
-                                    t.cliente_id = extract_id(cli_ed) if cli_ed and cli_ed != "-" else None
-                                    t.fornecedor_id = extract_id(forn_ed) if forn_ed and forn_ed != "-" else None
-                                    t.descricao = desc_ed
-                                    _done(s, "Lançamento atualizado.")
-
-        # Excluir
-        with colD:
-            st.markdown("**Excluir Lançamento**")
-            if df_tx.empty:
-                st.info("Sem lançamentos.")
-            else:
-                del_id = input_id_to_edit_delete(df_tx, "ID", key="tx_del_id")
-                if del_id and st.button("Excluir lançamento", key="tx_del_btn"):
-                    with get_session() as s:
-                        t = load_obj(s, Transacao, del_id)
-                        if t:
-                            s.delete(t)
-                            _done(s, "Lançamento excluído.")
-
-        # Anexos / Recibo
-        st.subheader("Anexos e Recibos")
-        colA, colB = st.columns([2, 1])
-        with colA:
-            trans_id = st.number_input("ID da transação", min_value=1, step=1, value=1, key="anx_tx_id")
-            up = st.file_uploader(
-                "Anexar arquivo",
-                type=["pdf", "png", "jpg", "jpeg", "xlsx", "csv", "docx", "zip"],
-                accept_multiple_files=True,
-                key="anx_uploader",
-            )
-            if st.button("Salvar Anexo(s)", key="anx_save"):
-                with get_session() as s:
-                    if not s.get(Transacao, int(trans_id)):
-                        error("Transação não encontrada.")
-                    else:
-                        for f in up or []:
-                            safe = _sanitize_filename(getattr(f, "name", "arquivo"))
-                            fname = f"T{int(trans_id)}_{int(datetime.utcnow().timestamp())}_{safe}"
-                            fpath = os.path.join(ATTACH_DIR, fname)
-                            with open(fpath, "wb") as fh:
-                                fh.write(f.getbuffer())
-                            s.add(Anexo(transacao_id=int(trans_id), filename=fname, path=fpath))
-                        _done(s, "Anexos salvos.")
-        with colB:
-            if st.button("Gerar Recibo (PDF)", key="recibo_btn"):
-                with get_session() as s:
-                    t = s.get(Transacao, int(trans_id))
-                    if not t:
-                        error("Transação não encontrada.")
-                    else:
-                        pdf_bytes = make_recibo_pdf(t, s)
-                        fname = f"RECIBO_T{t.id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
-                        fpath = os.path.join(ATTACH_DIR, fname)
-                        with open(fpath, "wb") as f:
-                            f.write(pdf_bytes)
-                        success(f"Recibo salvo em {fpath}")
-                        st.download_button("Baixar Recibo", data=pdf_bytes, file_name=fname, mime="application/pdf", key="recibo_download")
-
-    # --------- Transferências ---------
-    with tabs[1]:
-        st.caption("Transferências movem saldos entre bancos (não afetam resultado).")
-        with get_session() as s:
-            df_bancos = pd_read_sql(s.bind, "SELECT id, nome FROM bancos ORDER BY nome")
-
-        st.subheader("Incluir Transferência")
-        with st.form("form_trf_add", clear_on_submit=True):
-            c1, c2, c3, c4 = st.columns(4)
-            b_origem = c1.selectbox("Banco origem", [f"{r['nome']} (# {r['id']})" for _, r in df_bancos.iterrows()] if not df_bancos.empty else [], key="trf_add_origem")
-            b_dest   = c2.selectbox("Banco destino", [f"{r['nome']} (# {r['id']})" for _, r in df_bancos.iterrows()] if not df_bancos.empty else [], key="trf_add_dest")
-            valor    = c3.number_input("Valor (R$)", min_value=0.0, step=100.0, format="%.2f", key="trf_add_valor")
-            data_prev= c4.date_input("Data prevista", value=date.today(), key="trf_add_data")
-            desc     = st.text_input("Descrição (opcional)", key="trf_add_desc")
-            if st.form_submit_button("Cadastrar Transferência", key="trf_add_submit") and b_origem and b_dest and valor > 0:
-                o_id = extract_id(b_origem); d_id = extract_id(b_dest)
-                if not o_id or not d_id:
-                    error("Selecione origem e destino válidos.")
-                elif o_id == d_id:
-                    error("Origem e destino não podem ser iguais.")
-                else:
-                    with get_session() as s:
-                        s.add(Transferencia(banco_origem_id=o_id, banco_destino_id=d_id, valor=float(valor), data_prevista=data_prev, descricao=desc))
-                        _done(s, "Transferência cadastrada.")
-
-        st.subheader("Lista de Transferências")
-        with get_session() as s:
-            dft = pd_read_sql(s.bind, """
-                SELECT t.id, b1.nome AS origem, b2.nome AS destino, t.valor, t.data_prevista,
-                       t.foi_executada, t.data_real, t.descricao
-                FROM transferencias t
-                JOIN bancos b1 ON b1.id = t.banco_origem_id
-                JOIN bancos b2 ON b2.id = t.banco_destino_id
-                ORDER BY t.data_prevista DESC, t.id DESC
-            """)
-        st.dataframe(dft, width='stretch')
-
-        exec_id = input_id_to_edit_delete(dft, "ID para executar/desfazer", key="trf_exec_id") if not dft.empty else None
-        colx1, colx2 = st.columns(2)
-        with colx1:
-            if st.button("Executar agora", key="trf_exec_btn") and exec_id:
-                with get_session() as s:
-                    tr = s.get(Transferencia, int(exec_id))
-                    if not tr:
-                        error("Transferência não encontrada.")
-                    else:
-                        tr.foi_executada = True
-                        tr.data_real = date.today()
-                        _done(s, "Transferência executada.")
-        with colx2:
-            if st.button("Desfazer execução", key="trf_unexec_btn") and exec_id:
-                with get_session() as s:
-                    tr = s.get(Transferencia, int(exec_id))
-                    if not tr:
-                        error("Transferência não encontrada.")
-                    else:
-                        tr.foi_executada = False
-                        tr.data_real = None
-                        _done(s, "Execução desfeita.")
-
-        st.subheader("Editar / Excluir Transferência")
-        colE, colD = st.columns(2)
-        with colE:
-            if dft.empty:
-                st.info("Sem transferências.")
-            else:
-                edit_id = input_id_to_edit_delete(dft, "ID", key="trf_edit_id")
-                if edit_id:
-                    with get_session() as s:
-                        tr = load_obj(s, Transferencia, edit_id)
-                        df_bancos = pd_read_sql(s.bind, "SELECT id, nome FROM bancos ORDER BY nome")
-                        if tr:
-                            with st.form("form_trf_edit"):
-                                c1, c2, c3, c4 = st.columns(4)
-                                borig_cur = s.get(Banco, tr.banco_origem_id)
-                                bdest_cur = s.get(Banco, tr.banco_destino_id)
-                                borig = c1.selectbox("Origem", ([f"{borig_cur.nome} (# {tr.banco_origem_id})"] if borig_cur else []) + [f"{r['nome']} (# {r['id']})" for _, r in df_bancos.iterrows()], key="trf_edit_origem")
-                                bdest = c2.selectbox("Destino", ([f"{bdest_cur.nome} (# {tr.banco_destino_id})"] if bdest_cur else []) + [f"{r['nome']} (# {r['id']})" for _, r in df_bancos.iterrows()], key="trf_edit_dest")
-                                valor = c3.number_input("Valor", min_value=0.0, step=100.0, format="%.2f", value=float(tr.valor), key="trf_edit_valor")
-                                data_prev = c4.date_input("Data prevista", value=tr.data_prevista, key="trf_edit_data")
-                                foi = st.checkbox("Executada?", value=bool(tr.foi_executada), key="trf_edit_exec")
-                                data_real = st.date_input("Data real", value=tr.data_real or date.today(), key="trf_edit_data_real") if foi else None
-                                desc = st.text_input("Descrição", value=tr.descricao or "", key="trf_edit_desc")
-                                if st.form_submit_button("Salvar alterações", key="trf_edit_save"):
-                                    tr.banco_origem_id = extract_id(borig) or tr.banco_origem_id
-                                    tr.banco_destino_id = extract_id(bdest) or tr.banco_destino_id
-                                    tr.valor = float(valor); tr.data_prevista = data_prev
-                                    tr.foi_executada = foi; tr.data_real = (data_real if foi else None)
-                                    tr.descricao = desc
-                                    _done(s, "Transferência atualizada.")
-        with colD:
-            if dft.empty:
-                st.info("Sem transferências.")
-            else:
-                del_id = input_id_to_edit_delete(dft, "ID", key="trf_del_id")
-                if del_id and st.button("Excluir transferência", key="trf_del_btn"):
-                    with get_session() as s:
-                        tr = load_obj(s, Transferencia, del_id)
-                        if tr:
-                            s.delete(tr)
-                            _done(s, "Transferência excluída.")
-
-# ===========================
-# Relatórios
-# ===========================
-elif page == "Relatórios":
-    st.header("Relatórios")
-    f1, f2, f3 = st.columns(3)
-    tipo_filtro = f1.selectbox("Tipo", ["Entradas e Saídas", "Entradas", "Saídas"], index=0, key="rel_tipo")
-    dt_ini = f2.date_input("De", value=date.today().replace(day=1), key="rel_de")
-    dt_fim = f3.date_input("Até", value=date.today(), key="rel_ate")
-
-    tipo_sql = ""
-    if tipo_filtro == "Entradas":
-        tipo_sql = "AND t.tipo='Entrada'"
-    elif tipo_filtro == "Saídas":
-        tipo_sql = "AND t.tipo='Saida'"
-
-    with get_session() as s:
-        df_rel = pd_read_sql(
-            s.bind,
-            f"""
-            SELECT t.id, t.tipo, c.nome AS categoria, s2.nome AS subcategoria, t.valor,
-                   t.data_prevista, t.foi_pago, t.data_real, b.nome AS banco, t.descricao
-            FROM transacoes t
-            JOIN categorias c ON c.id=t.categoria_id
-            LEFT JOIN subcategorias s2 ON s2.id=t.subcategoria_id
-            LEFT JOIN bancos b ON b.id=t.banco_id
-            WHERE DATE(t.data_prevista) BETWEEN :d1 AND :d2
-            {tipo_sql}
-            ORDER BY t.data_prevista ASC, t.id ASC
-            """,
-            params={"d1": dt_ini.isoformat(), "d2": dt_fim.isoformat()},
-        )
-
-    st.dataframe(df_rel, width='stretch')
-    colT1, colT2, colT3 = st.columns(3)
-    tot_e = df_rel.loc[df_rel["tipo"] == "Entrada", "valor"].sum()
-    tot_s = df_rel.loc[df_rel["tipo"] == "Saida", "valor"].sum()
-    with colT1: st.metric("Total Entradas", money(tot_e))
-    with colT2: st.metric("Total Saídas", money(tot_s))
-    with colT3: st.metric("Resultado", money(tot_e - tot_s))
-
-    if not df_rel.empty:
-        csv = df_rel.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("Exportar CSV", data=csv, file_name="relatorio.csv", mime="text/csv")
-
-# ===========================
-# Painéis / Dashboards
-# ===========================
-elif page in ("Painéis", "Dashboards"):
-    st.header("Painéis / Dashboards")
-
-    PLOTLY_CONFIG = {
-        "displaylogo": False,
-        "modeBarButtonsToRemove": ["zoomIn2d", "zoomOut2d", "autoScale2d"],
-        "toImageButtonOptions": {"format": "png", "filename": "grafico"},
-        "scrollZoom": False,
+def default_state():
+    """
+    Estado inicial padrão de um projeto.
+    Corrige o NameError quando create_project(default_state(), ...) é chamado.
+    """
+    return {
+        "tap": {
+            "nome": "",
+            "status": "rascunho",
+            "dataInicio": date.today().strftime("%Y-%m-%d"),
+            "gerente": "",
+            "patrocinador": "",
+            "objetivo": "",
+            "escopo": "",
+            "premissas": "",
+            "requisitos": "",
+            "alteracoesEscopo": [],
+        },
+        "eapTasks": [],
+        "finances": [],
+        "kpis": [],
+        "risks": [],
+        "lessons": [],
+        "close": {},
+        "actionPlan": [],
     }
 
-    colf = st.columns(3)
-    dt_ini = colf[0].date_input("Início da análise", value=date(date.today().year, 1, 1), key="dash_ini")
-    dt_fim = colf[1].date_input("Fim da análise", value=date.today(), key="dash_fim")
-    colf[2].markdown("O **acumulado** começa exatamente na data de *Início da análise*.")
+# --------------------------------------------------------
+# BANCO DE DADOS - NEON POSTGRESQL
+# --------------------------------------------------------
 
-    if dt_ini > dt_fim:
-        st.warning("Período inválido (início > fim). Ajustei automaticamente.")
-        dt_ini, dt_fim = dt_fim, dt_ini
+def get_conn():
+    """
+    Abre conexão com o banco Neon usando a URL do secrets.toml.
+    """
+    db_url = st.secrets["general"]["database_url"]
+    conn = psycopg2.connect(db_url)
+    return conn
 
-    # --- consultas (use sempre pd.read_sql(sql, con, params=...) ---
-    with get_session() as s:
-        df_real = pd.read_sql(
-            text(f"""
-            SELECT t.id, t.tipo, t.valor,
-                t.data_prevista, t.foi_pago, t.data_real,
-                c.nome AS categoria, cc.nome AS centro_custo
-            FROM transacoes t
-            JOIN categorias c ON c.id = t.categoria_id
-            LEFT JOIN centros_custo cc ON cc.id = t.centro_custo_id
-            WHERE t.foi_pago = {sql_bool(True)}
-            AND t.data_real::date BETWEEN :ini AND :fim
-            """),
-            s.bind,
-            params={"ini": dt_ini.isoformat(), "fim": dt_fim.isoformat()},
+def init_db():
+    """
+    Cria a tabela de projetos no PostgreSQL, caso ainda não exista.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS projects (
+            id SERIAL PRIMARY KEY,
+            data TEXT,
+            nome TEXT,
+            status TEXT,
+            dataInicio TEXT,
+            gerente TEXT,
+            patrocinador TEXT,
+            encerrado BOOLEAN DEFAULT FALSE
+        );
+        """
+    )
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def list_projects():
+    """
+    Retorna a lista de projetos.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, nome, status, dataInicio, gerente, patrocinador, encerrado
+        FROM projects
+        ORDER BY id DESC;
+        """
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    projetos = []
+    for r in rows:
+        projetos.append(
+            {
+                "id": r[0],
+                "nome": r[1] or "",
+                "status": r[2] or "",
+                "dataInicio": r[3] or "",
+                "gerente": r[4] or "",
+                "patrocinador": r[5] or "",
+                "encerrado": bool(r[6]),
+            }
         )
+    return projetos
 
-        df_prev = pd.read_sql(
-            text(f"""
-            SELECT t.id, t.tipo, t.valor,
-                t.data_prevista, t.foi_pago, t.data_real,
-                c.nome AS categoria, cc.nome AS centro_custo
-            FROM transacoes t
-            JOIN categorias c ON c.id = t.categoria_id
-            LEFT JOIN centros_custo cc ON cc.id = t.centro_custo_id
-            WHERE t.foi_pago = {sql_bool(False)}
-            AND t.data_prevista::date BETWEEN :ini AND :fim
-            """),
-            s.bind,
-            params={"ini": dt_ini.isoformat(), "fim": dt_fim.isoformat()},
-        )
+def load_project_state(project_id: int):
+    """
+    Carrega o JSON do campo 'data' para o estado do projeto.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT data FROM projects WHERE id = %s;", (project_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
 
-    st.divider()
+    if row and row[0]:
+        try:
+            data = json.loads(row[0])
+            if "actionPlan" not in data:
+                data["actionPlan"] = []
+            return data
+        except Exception:
+            return default_state()
+    return default_state()
 
-# --- Fluxo mensal (Realizado) — Entradas x Saídas ---
+def save_project_state(project_id: int, data: dict):
+    """
+    Atualiza o registro do projeto com o JSON completo e
+    campos principais desnormalizados.
+    """
+    tap = data.get("tap", {}) if isinstance(data, dict) else {}
+    nome = tap.get("nome", "") or ""
+    status = tap.get("status", "rascunho") or "rascunho"
+    dataInicio = tap.get("dataInicio", "") or ""
+    gerente = tap.get("gerente", "") or ""
+    patrocinador = tap.get("patrocinador", "") or ""
 
-    st.subheader("Fluxo mensal (Realizado) — Entradas x Saídas")
-    if not df_real.empty:
-        dfm = df_real.copy()
-        dfm["Mês"] = pd.to_datetime(dfm["data_real"]).dt.to_period("M").astype(str)
-        g = (
-            dfm.groupby(["Mês", "tipo"], as_index=False)["valor"]
-               .sum()
-               .pivot(index="Mês", columns="tipo", values="valor")
-               .fillna(0.0)
-               .reset_index()
-        )
-        if "Entrada" not in g.columns: g["Entrada"] = 0.0
-        if "Saida"   not in g.columns: g["Saida"]   = 0.0
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE projects
+        SET data = %s,
+            nome = %s,
+            status = %s,
+            dataInicio = %s,
+            gerente = %s,
+            patrocinador = %s
+        WHERE id = %s;
+        """,
+        (json.dumps(data), nome, status, dataInicio, gerente, patrocinador, project_id),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
 
-        fig1 = px.bar(
-            g, x="Mês", y=["Entrada", "Saida"], barmode="group",
-            title=f"Entradas x Saídas (Realizado) por mês — {dt_ini.strftime('%d/%m/%Y')} a {dt_fim.strftime('%d/%m/%Y')}",
-            template="plotly_white",
-        )
-        fig1.update_layout(legend_title_text="", margin=dict(l=10, r=10, t=50, b=10), yaxis_title="R$")
-        st.plotly_chart(fig1, config=PLOTLY_CONFIG, width='stretch', key=uikey("dash-fig1"))
-    else:
-        st.info("Sem movimentos **realizados** no período para montar o fluxo mensal.")
+def create_project(initial_data=None, meta=None) -> int:
+    """
+    Cria um novo projeto e retorna o ID.
+    """
+    if initial_data is None:
+        initial_data = default_state()
+    if meta is None:
+        meta = {}
 
-    st.divider()
+    tap = initial_data.get("tap", {})
 
-    # --- Fluxo de Caixa — Saldo Acumulado (Realizado) ---
-    st.subheader("Fluxo de Caixa — Saldo Acumulado (Realizado)")
-    if not df_real.empty:
-        acc = df_real.copy()
-        acc["dia"] = pd.to_datetime(acc["data_real"]).dt.date
-        acc["var"] = acc.apply(lambda r: r["valor"] if r["tipo"] == "Entrada" else -r["valor"], axis=1)
-        daily = acc.groupby("dia", as_index=False)["var"].sum().sort_values("dia")
-        idx = pd.date_range(start=dt_ini, end=dt_fim, freq="D")
-        daily = daily.set_index("dia").reindex(idx, fill_value=0.0).rename_axis("dia").reset_index()
-        daily["acumulado"] = daily["var"].cumsum()
-        daily["dia"] = pd.to_datetime(daily["dia"]).dt.date
+    nome = meta.get("nome") or tap.get("nome") or "Novo projeto"
+    status = meta.get("status") or tap.get("status") or "rascunho"
+    dataInicio = meta.get("dataInicio") or tap.get("dataInicio") or ""
+    gerente = meta.get("gerente") or tap.get("gerente") or ""
+    patrocinador = meta.get("patrocinador") or tap.get("patrocinador") or ""
 
-        fig2 = px.line(
-            daily, x="dia", y="acumulado", markers=True,
-            title=f"Saldo acumulado (de {dt_ini.strftime('%d/%m/%Y')} até {dt_fim.strftime('%d/%m/%Y')})",
-            template="plotly_white",
-        )
-        fig2.update_layout(xaxis_title="Data", yaxis_title="R$", margin=dict(l=10, r=10, t=50, b=10))
-        st.plotly_chart(
-            fig2,
-            config={**PLOTLY_CONFIG, "toImageButtonOptions": {"format": "png", "filename": "saldo_acumulado"}},
-            width='stretch',
-            key=uikey("dash-fig2")
-        )
-    else:
-        st.info("Sem movimentos **realizados** no período para montar o acumulado.")
+    tap["nome"] = nome
+    tap["status"] = status
+    tap["dataInicio"] = dataInicio
+    tap["gerente"] = gerente
+    tap["patrocinador"] = patrocinador
+    initial_data["tap"] = tap
 
-    st.divider()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO projects (data, nome, status, dataInicio, gerente, patrocinador, encerrado)
+        VALUES (%s, %s, %s, %s, %s, %s, FALSE)
+        RETURNING id;
+        """,
+        (
+            json.dumps(initial_data),
+            nome,
+            status,
+            dataInicio,
+            gerente,
+            patrocinador,
+        ),
+    )
+    project_id = cur.fetchone()[0]
+    conn.commit()
+    cur.close()
+    conn.close()
+    return project_id
 
-    # --- Previsto vs. Realizado por Centro de Custo ---
-    st.subheader("Previsto vs. Realizado por Centro de Custo")
-    prev_cc = pd.DataFrame(columns=["centro_custo", "previsto"])
-    if not df_prev.empty:
-        p = df_prev.copy()
-        p["centro_custo"] = p["centro_custo"].fillna("(sem CC)")
-        prev_cc = p.groupby("centro_custo", as_index=False)["valor"].sum().rename(columns={"valor": "previsto"})
+def close_project(project_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE projects SET encerrado = TRUE, status = %s WHERE id = %s;",
+        ("encerrado", project_id),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
 
-    real_cc = pd.DataFrame(columns=["centro_custo", "realizado"])
-    if not df_real.empty:
-        r = df_real.copy()
-        r["centro_custo"] = r["centro_custo"].fillna("(sem CC)")
-        real_cc = r.groupby("centro_custo", as_index=False)["valor"].sum().rename(columns={"valor": "realizado"})
+def reopen_project(project_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE projects SET encerrado = FALSE WHERE id = %s;",
+        (project_id,),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
 
-    comp_cc = pd.merge(prev_cc, real_cc, on="centro_custo", how="outer").fillna(0.0)
+def delete_project(project_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM projects WHERE id = %s;", (project_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
 
-    if comp_cc.empty:
-        st.info("Sem dados de **previsto/realizado** por Centro de Custo no período.")
-    else:
-        comp_cc_long = comp_cc.melt(
-            id_vars="centro_custo",
-            value_vars=["previsto", "realizado"],
-            var_name="Tipo",
-            value_name="Valor"
-        )
-        fig3 = px.bar(
-            comp_cc_long, x="centro_custo", y="Valor", color="Tipo", barmode="group",
-            title="Previsto vs. Realizado por Centro de Custo (período selecionado)",
-            template="plotly_white",
-        )
-        fig3.update_layout(
-            xaxis_title="Centro de Custo", yaxis_title="R$", legend_title_text="",
-            margin=dict(l=10, r=10, t=50, b=10)
-        )
-        st.plotly_chart(
-            fig3,
-            config={**PLOTLY_CONFIG, "toImageButtonOptions": {"format": "png", "filename": "previsto_vs_realizado_cc"}},
-            width='stretch',
-            key=uikey("dash-fig3")
-        )
+# --------------------------------------------------------
+# CPM / GANTT / CURVA S TRABALHO
+# --------------------------------------------------------
 
-    st.divider()
+def calcular_cpm(tasks):
+    if not tasks:
+        return tasks, 0
 
-    # --- Gastos por Categoria (Saídas — Realizado) ---
-    st.subheader("Gastos por Categoria (Saídas — Realizado)")
-    if not df_real.empty:
-        saidas = df_real[df_real["tipo"] == "Saida"].copy()
-        if saidas.empty:
-            st.info("Não há **saídas realizadas** no período.")
+    tasks = [dict(t) for t in tasks]
+    mapa = {t["codigo"]: t for t in tasks}
+
+    for t in tasks:
+        t["es"] = 0
+        t["ef"] = 0
+        t["ls"] = 0
+        t["lf"] = 0
+        t["slack"] = 0
+
+    max_iter = 1000
+    for _ in range(max_iter):
+        atualizado = False
+        for t in tasks:
+            dur = int(t.get("duracao") or 0)
+            preds = t.get("predecessoras") or []
+            rel = t.get("relacao") or "FS"
+
+            if preds:
+                max_start = 0
+                todos_ok = True
+                for cod in preds:
+                    p = mapa.get(cod)
+                    if not p:
+                        todos_ok = False
+                        break
+                    if rel in ("FS", "FF"):
+                        cand = p.get("ef", 0)
+                    else:
+                        cand = p.get("es", 0)
+                    if cand > max_start:
+                        max_start = cand
+                if not todos_ok:
+                    continue
+                if t["ef"] == 0:
+                    t["es"] = max_start
+                    t["ef"] = t["es"] + dur
+                    atualizado = True
+            else:
+                if t["ef"] == 0:
+                    t["es"] = 0
+                    t["ef"] = dur
+                    atualizado = True
+        if not atualizado:
+            break
+
+    projeto_fim = max((t["ef"] for t in tasks), default=0)
+
+    succ_map = {t["codigo"]: [] for t in tasks}
+    for t in tasks:
+        for cod_p in (t.get("predecessoras") or []):
+            if cod_p in succ_map:
+                succ_map[cod_p].append(t["codigo"])
+
+    ordem = sorted(tasks, key=lambda x: x["es"], reverse=True)
+    for t in ordem:
+        cod = t["codigo"]
+        dur = int(t.get("duracao") or 0)
+        succs = succ_map.get(cod) or []
+        if not succs:
+            t["lf"] = projeto_fim
+            t["ls"] = projeto_fim - dur
         else:
-            gcat = saidas.groupby("categoria", as_index=False)["valor"].sum().sort_values("valor", ascending=False)
-            fig4 = px.bar(
-                gcat, x="categoria", y="valor",
-                title="Total de Saídas por Categoria (Realizado)",
-                template="plotly_white"
-            )
-            fig4.update_layout(xaxis_title="Categoria", yaxis_title="R$", margin=dict(l=10, r=10, t=50, b=10))
-            st.plotly_chart(
-                fig4,
-                config={**PLOTLY_CONFIG, "toImageButtonOptions": {"format": "png", "filename": "gastos_por_categoria"}},
-                width='stretch',
-                key=uikey("dash-fig4")
-            )
+            min_ls = None
+            for scod in succs:
+                s = mapa[scod]
+                if s["lf"] == 0:
+                    s["lf"] = s["ef"]
+                    s["ls"] = s["lf"] - int(s.get("duracao") or 0)
+                if (min_ls is None) or (s["ls"] < min_ls):
+                    min_ls = s["ls"]
+            if min_ls is None:
+                min_ls = projeto_fim - dur
+            t["lf"] = min_ls
+            t["ls"] = t["lf"] - dur
+
+        t["slack"] = t["ls"] - t["es"]
+
+    return tasks, projeto_fim
+
+def gerar_curva_s_trabalho(tasks, data_inicio_str):
+    if not tasks or not data_inicio_str:
+        return None
+
+    tasks_cpm, total_dias = calcular_cpm(tasks)
+    if total_dias <= 0:
+        return None
+
+    soma_duracoes = sum(int(t.get("duracao") or 0) for t in tasks_cpm)
+    if soma_duracoes <= 0:
+        return None
+
+    dias = list(range(0, total_dias + 1))
+    progresso = []
+
+    for d in dias:
+        acum = 0
+        for t in tasks_cpm:
+            dur = int(t.get("duracao") or 0)
+            es = t.get("es", 0)
+            peso = dur / soma_duracoes if soma_duracoes > 0 else 0
+            if d <= es:
+                frac = 0
+            elif d >= es + dur:
+                frac = 1
+            else:
+                frac = (d - es) / dur
+            acum += peso * frac
+        progresso.append(acum * 100.0)
+
+    df = pd.DataFrame(
+        {
+            "Dia do Projeto": dias,
+            "Progresso (%)": progresso,
+        }
+    )
+    fig = px.line(
+        df,
+        x="Dia do Projeto",
+        y="Progresso (%)",
+        title=f"Curva S de Trabalho (a partir de {data_inicio_str})",
+    )
+    fig.update_traces(mode="lines+markers")
+    fig.update_layout(
+        template="plotly_dark",
+        height=350,
+        margin=dict(l=30, r=20, t=35, b=30),
+    )
+    return fig
+
+# --------------------------------------------------------
+# FINANCEIRO / CURVA S FINANCEIRA
+# --------------------------------------------------------
+
+def adicionar_dias(dt: date, qtd: int) -> date:
+    return dt + timedelta(days=qtd)
+
+def expandir_recorrencia(lanc, inicio: date, fim: date):
+    ocorrencias = []
+    base = datetime.strptime(lanc["dataPrevista"], "%Y-%m-%d").date()
+    rec = lanc.get("recorrencia", "Nenhuma")
+    qtd = lanc.get("qtdRecorrencias") or lanc.get("quantidadeRecorrencias") or 0
+    try:
+        qtd = int(qtd)
+    except Exception:
+        qtd = 0
+
+    if rec == "Diária":
+        inc = 1
+    elif rec == "Semanal":
+        inc = 7
+    elif rec == "Quinzenal":
+        inc = 14
+    elif rec == "Mensal":
+        inc = 30
     else:
-        st.info("Sem movimentos **realizados** para compor *Gastos por Categoria*.")
+        inc = None
+
+    if inc is None:
+        if inicio <= base <= fim:
+            ocorrencias.append(base)
+        return ocorrencias
+
+    d = base
+    count = 0
+    while d <= fim:
+        if d >= inicio:
+            ocorrencias.append(d)
+            count += 1
+            if qtd and count >= qtd:
+                break
+        d = adicionar_dias(d, inc)
+    return ocorrencias
+
+def gerar_curva_s_financeira(finances, inicio_str, meses):
+    if not finances or not inicio_str:
+        return None, None
+
+    ano, mes = map(int, inicio_str.split("-"))
+    inicio = date(ano, mes, 1)
+    fim = date(
+        ano if mes + meses <= 12 else ano + (mes + meses - 1) // 12,
+        (mes + meses - 1) % 12 + 1,
+        1,
+    ) - timedelta(days=1)
+
+    def key_mes(d: date):
+        return f"{d.year}-{str(d.month).zfill(2)}"
+
+    mapa_prev = {}
+    mapa_real = {}
+
+    cursor = inicio
+    while cursor <= fim:
+        k = key_mes(cursor)
+        mapa_prev[k] = 0.0
+        mapa_real[k] = 0.0
+        if cursor.month == 12:
+            cursor = date(cursor.year + 1, 1, 1)
+        else:
+            cursor = date(cursor.year, cursor.month + 1, 1)
+
+    for l in finances:
+        tipo = l["tipo"]
+        valor = float(l["valor"])
+        fator = 1 if tipo == "Entrada" else -1
+
+        ocorrencias = expandir_recorrencia(l, inicio, fim)
+        for d in ocorrencias:
+            k = key_mes(d)
+            mapa_prev[k] += fator * valor
+
+        if l.get("realizado") and l.get("dataRealizada"):
+            dr = datetime.strptime(l["dataRealizada"], "%Y-%m-%d").date()
+            if inicio <= dr <= fim:
+                k = key_mes(dr)
+                mapa_real[k] += fator * valor
+
+    labels = sorted(mapa_prev.keys())
+    prev_vals = [mapa_prev[k] for k in labels]
+    real_vals = [mapa_real[k] for k in labels]
+
+    prev_acum = []
+    real_acum = []
+    ap = 0
+    ar = 0
+    for p, r in zip(prev_vals, real_vals):
+        ap += p
+        ar += r
+        prev_acum.append(ap)
+        real_acum.append(ar)
+
+    df = pd.DataFrame(
+        {
+            "Mês": labels,
+            "Previsto (acumulado)": prev_acum,
+            "Realizado (acumulado)": real_acum,
+        }
+    )
+    fig = px.line(
+        df,
+        x="Mês",
+        y=["Previsto (acumulado)", "Realizado (acumulado)"],
+        title="Curva S Financeira - Previsto x Realizado (Acumulado)",
+    )
+    fig.update_traces(mode="lines+markers")
+    fig.update_layout(
+        template="plotly_dark",
+        height=350,
+        margin=dict(l=30, r=20, t=35, b=30),
+    )
+
+    return df, fig
+
+# --------------------------------------------------------
+# INICIALIZAÇÃO
+# --------------------------------------------------------
+
+init_db()
+
+if "current_project_id" not in st.session_state:
+    projetos_ini = list_projects()
+    if not projetos_ini:
+        pid = create_project(default_state(), {"nome": "Projeto 1"})
+        st.session_state.current_project_id = pid
+        st.session_state.state = load_project_state(pid)
+    else:
+        pid = projetos_ini[0]["id"]
+        st.session_state.current_project_id = pid
+        st.session_state.state = load_project_state(pid)
+
+if "state" not in st.session_state:
+    st.session_state.state = default_state()
+
+# --------------------------------------------------------
+# HEADER GLOBAL
+# --------------------------------------------------------
+
+col_title, col_info = st.columns([4, 3])
+with col_title:
+    st.markdown(
+        "<div class='bk-card'>"
+        "<div class='main-title'>Gestão de Projetos PMBOK</div>"
+        "<div class='main-subtitle'>BK Engenharia e Tecnologia &mdash; TAP, EAP, Gantt, Curva S, Finanças, Qualidade, Riscos, Lições e Encerramento.</div>"
+        "</div>",
+        unsafe_allow_html=True
+    )
+
+with col_info:
+    st.markdown(
+        f"<div style='text-align:right; font-size:12px; color:#9ca3af; padding-top:6px;'>"
+        f"Usuário: <strong>BK Engenharia</strong><br>Data: {datetime.now().strftime('%d/%m/%Y %H:%M')}</div>",
+        unsafe_allow_html=True
+    )
+
+st.markdown("---")
+
+# --------------------------------------------------------
+# SIDEBAR - PROJETOS
+# --------------------------------------------------------
+
+st.sidebar.markdown("### 🔁 Projetos")
+
+projetos = list_projects()
+if not projetos:
+    pid = create_project(default_state(), {"nome": "Projeto 1"})
+    st.session_state.current_project_id = pid
+    st.session_state.state = load_project_state(pid)
+    st.rerun()
+
+proj_labels = []
+id_to_label = {}
+label_to_id = {}
+for p in projetos:
+    status = p["status"] or "rascunho"
+    status_tag = f" ({status})"
+    extra = " [ENCERRADO]" if p["encerrado"] else ""
+    label = f"#{p['id']} - {p['nome']}{status_tag}{extra}"
+    proj_labels.append(label)
+    id_to_label[p["id"]] = label
+    label_to_id[label] = p["id"]
+
+current_id = st.session_state.current_project_id
+current_label = id_to_label.get(current_id, proj_labels[0])
+
+selected_label = st.sidebar.selectbox(
+    "Selecione o projeto",
+    proj_labels,
+    index=proj_labels.index(current_label),
+)
+
+selected_id = label_to_id[selected_label]
+
+if selected_id != st.session_state.current_project_id:
+    st.session_state.current_project_id = selected_id
+    st.session_state.state = load_project_state(selected_id)
+    st.rerun()
+
+projetos = list_projects()
+current_id = st.session_state.current_project_id
+current_proj = next((p for p in projetos if p["id"] == current_id), projetos[0])
+
+with st.sidebar.expander("Ações do projeto atual", expanded=True):
+    st.write(f"ID: `{current_proj['id']}`")
+    st.write(f"Status: `{current_proj['status'] or 'rascunho'}`")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        novo_nome = st.text_input("Novo nome do projeto", value=current_proj["nome"], key="rename_proj")
+        if st.button("💾 Renomear"):
+            st.session_state.state["tap"]["nome"] = novo_nome
+            save_project_state(st.session_state.current_project_id, st.session_state.state)
+            st.success("Projeto renomeado.")
+            st.rerun()
+    with c2:
+        if current_proj["encerrado"]:
+            if st.button("🔓 Reabrir"):
+                reopen_project(st.session_state.current_project_id)
+                st.success("Projeto reaberto.")
+                st.rerun()
+        else:
+            if st.button("📦 Encerrar"):
+                close_project(st.session_state.current_project_id)
+                st.success("Projeto encerrado (arquivado).")
+                st.rerun()
+
+    st.markdown("---")
+
+    if st.button("➕ Criar novo projeto"):
+        meta = {
+            "nome": f"Projeto {len(projetos) + 1}",
+            "status": "rascunho",
+        }
+        pid = create_project(default_state(), meta)
+        st.session_state.current_project_id = pid
+        st.session_state.state = load_project_state(pid)
+        st.success("Novo projeto criado.")
+        st.rerun()
+
+    if st.button("🗑️ Excluir este projeto"):
+        proj_id = st.session_state.current_project_id
+        delete_project(proj_id)
+        st.session_state.pop("current_project_id", None)
+        st.session_state.pop("state", None)
+        st.success("Projeto excluído.")
+        st.rerun()
+
+# --------------------------------------------------------
+# CARREGA ESTADO ATUAL
+# --------------------------------------------------------
+
+state = st.session_state.state
+
+tap = state.get("tap", {})
+eapTasks = state.get("eapTasks", [])
+finances = state.get("finances", [])
+kpis = state.get("kpis", [])
+risks = state.get("risks", [])
+lessons = state.get("lessons", [])
+close_data = state.get("close", {})
+action_plan = state.get("actionPlan", [])
+
+for idx, t in enumerate(eapTasks):
+    if "id" not in t:
+        t["id"] = int(datetime.now().timestamp() * 1000) + idx
+
+# --------------------------------------------------------
+# FUNÇÃO SALVAR
+# --------------------------------------------------------
+
+def salvar_estado():
+    st.session_state.state = {
+        "tap": tap,
+        "eapTasks": eapTasks,
+        "finances": finances,
+        "kpis": kpis,
+        "risks": risks,
+        "lessons": lessons,
+        "close": close_data,
+        "actionPlan": action_plan,
+    }
+    save_project_state(st.session_state.current_project_id, st.session_state.state)
+
+# --------------------------------------------------------
+# TABS
+# --------------------------------------------------------
+
+tabs = st.tabs(
+    [
+        "🏠 Home / Resumo",
+        "📜 TAP & Requisitos",
+        "📦 EAP / Curva S Trabalho",
+        "💰 Financeiro / Curva S",
+        "📊 Qualidade (KPIs)",
+        "⚠️ Riscos",
+        "🧠 Lições Aprendidas",
+        "✅ Encerramento",
+        "📑 Relatórios HTML",
+        "📌 Plano de Ação",
+    ]
+)
+
+# --------------------------------------------------------
+# TAB 0 - HOME
+# --------------------------------------------------------
+
+with tabs[0]:
+    st.markdown("### 🏠 Visão geral do projeto")
+
+    nome_header = tap.get("nome") or current_proj.get("nome") or "Projeto sem nome"
+
+    st.markdown(
+        f"**Projeto atual:** `#{current_proj['id']} - {nome_header}`"
+    )
+
+    col_a, col_b, col_c, col_d = st.columns(4)
+    with col_a:
+        st.metric("ID do projeto", current_proj["id"])
+    with col_b:
+        status_home = tap.get("status") or current_proj.get("status") or "rascunho"
+        st.metric("Status TAP", status_home)
+    with col_c:
+        st.metric("Qtde de atividades (EAP)", len(eapTasks))
+    with col_d:
+        st.metric("Lançamentos financeiros", len(finances))
+
+    st.markdown("#### Dados principais")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.write("**Nome**")
+        st.info(tap.get("nome") or current_proj.get("nome") or "Não definido", icon="📌")
+    with c2:
+        st.write("**Gerente**")
+        st.info(tap.get("gerente") or current_proj.get("gerente") or "Não informado", icon="👤")
+    with c3:
+        st.write("**Patrocinador**")
+        st.info(tap.get("patrocinador") or current_proj.get("patrocinador") or "Não informado", icon="💼")
+
+    atrasadas = 0
+    a_fazer = 0
+    if eapTasks:
+        a_fazer = sum(1 for t in eapTasks if t.get("status") != "concluido")
+        if tap.get("dataInicio"):
+            try:
+                tasks_cpm, _ = calcular_cpm(eapTasks)
+                data_inicio_dt = datetime.strptime(tap["dataInicio"], "%Y-%m-%d").date()
+                hoje = date.today()
+                for t in tasks_cpm:
+                    status_t = t.get("status", "nao-iniciado")
+                    if status_t != "concluido":
+                        ef_dia = t.get("ef", 0)
+                        fim_prev = data_inicio_dt + timedelta(days=ef_dia)
+                        if fim_prev < hoje:
+                            atrasadas += 1
+            except Exception:
+                pass
+
+    saldo_real = 0.0
+    if finances:
+        df_fin_home = pd.DataFrame(finances)
+        if "realizado" in df_fin_home.columns:
+            entradas_real = df_fin_home[
+                (df_fin_home["tipo"] == "Entrada") & (df_fin_home["realizado"])
+            ]["valor"].sum()
+            saidas_real = df_fin_home[
+                (df_fin_home["tipo"] == "Saída") & (df_fin_home["realizado"])
+            ]["valor"].sum()
+            saldo_real = entradas_real - saidas_real
+
+    st.markdown("#### Situação operacional e financeira")
+    c_sit1, c_sit2, c_sit3 = st.columns(3)
+    with c_sit1:
+        st.metric("Atividades em atraso", atrasadas)
+    with c_sit2:
+        st.metric("Atividades a fazer", a_fazer)
+    with c_sit3:
+        st.metric("Saldo financeiro real", format_currency_br(saldo_real))
+
+    st.markdown("#### Últimos registros")
+    col_l, col_r = st.columns(2)
+    with col_l:
+        st.write("**Últimas alterações de escopo**")
+        alt = tap.get("alteracoesEscopo") or []
+        if alt:
+            df_alt = pd.DataFrame(alt)
+            st.dataframe(df_alt.tail(5), use_container_width=True, height=160)
+        else:
+            st.caption("Nenhuma alteração registrada.")
+    with col_r:
+        st.write("**Últimos riscos**")
+        if risks:
+            df_r = pd.DataFrame(risks)
+            st.dataframe(
+                df_r[["descricao", "impacto", "prob", "indice"]].tail(5),
+                use_container_width=True,
+                height=160,
+            )
+        else:
+            st.caption("Nenhum risco registrado.")
+
+# --------------------------------------------------------
+# TAB 1 - TAP
+# --------------------------------------------------------
+
+with tabs[1]:
+    st.markdown("### 📜 Termo de Abertura do Projeto (TAP)")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        tap["nome"] = st.text_input("Nome do projeto", value=tap.get("nome", ""))
+        data_inicio = tap.get("dataInicio") or ""
+        tap["dataInicio"] = st.date_input(
+            "Data de início",
+            value=datetime.strptime(data_inicio, "%Y-%m-%d").date()
+            if data_inicio
+            else date.today(),
+        ).strftime("%Y-%m-%d")
+        tap["gerente"] = st.text_input("Gerente do projeto", value=tap.get("gerente", ""))
+        tap["patrocinador"] = st.text_input("Patrocinador", value=tap.get("patrocinador", ""))
+
+    with c2:
+        status_opcoes = ["rascunho", "em_aprovacao", "aprovado", "encerrado"]
+        status_atual = tap.get("status", "rascunho")
+        if status_atual not in status_opcoes:
+            status_atual = "rascunho"
+        tap["status"] = st.selectbox(
+            "Status do TAP",
+            status_opcoes,
+            index=status_opcoes.index(status_atual),
+        )
+        tap["objetivo"] = st.text_area(
+            "Objetivo do projeto",
+            value=tap.get("objetivo", ""),
+            height=90,
+        )
+        tap["escopo"] = st.text_area(
+            "Escopo inicial",
+            value=tap.get("escopo", ""),
+            height=90,
+        )
+        tap["premissas"] = st.text_area(
+            "Premissas e restrições",
+            value=tap.get("premissas", ""),
+            height=90,
+        )
+
+    st.markdown("#### Requisitos e alterações de escopo")
+
+    col_req, col_alt = st.columns([1, 1.2])
+    with col_req:
+        tap["requisitos"] = st.text_area(
+            "Requisitos principais",
+            value=tap.get("requisitos", ""),
+            height=150,
+        )
+
+    with col_alt:
+        nova_alt = st.text_area("Nova alteração de escopo", "", height=100)
+        c_al1, c_al2 = st.columns(2)
+        with c_al1:
+            if st.button("Registrar alteração"):
+                if not nova_alt.strip():
+                    st.warning("Descreva a alteração antes de registrar.")
+                else:
+                    item = {
+                        "data": datetime.now().strftime("%d/%m/%Y %H:%M"),
+                        "descricao": nova_alt.strip(),
+                    }
+                    tap.setdefault("alteracoesEscopo", []).append(item)
+                    salvar_estado()
+                    st.success("Alteração registrada.")
+                    st.rerun()
+        with c_al2:
+            if st.button("Aprovar alteração de escopo"):
+                if not tap.get("alteracoesEscopo"):
+                    st.warning("Não há alterações registradas.")
+                else:
+                    st.info(
+                        "Lembre-se de atualizar EAP, cronograma, financeiro e riscos."
+                    )
+
+        st.write("**Histórico de alterações**")
+        alt = tap.get("alteracoesEscopo") or []
+        if alt:
+            df_alt = pd.DataFrame(alt)
+            st.dataframe(df_alt, use_container_width=True, height=180)
+
+            idx_alt = st.selectbox(
+                "Selecione uma alteração para editar / excluir",
+                options=list(range(len(alt))),
+                format_func=lambda i: f"{df_alt.iloc[i]['data']} - {df_alt.iloc[i]['descricao'][:60]}",
+                key="tap_del_alt_idx"
+            )
+            # --------- EDIÇÃO DE ALTERAÇÃO DE ESCOPO ---------
+            alt_sel = tap["alteracoesEscopo"][idx_alt]
+            nova_desc_alt_edit = st.text_area(
+                "Editar descrição da alteração selecionada",
+                value=alt_sel.get("descricao", ""),
+                height=100,
+                key="tap_alt_edit_desc"
+            )
+            if st.button("Salvar alteração de escopo editada"):
+                tap["alteracoesEscopo"][idx_alt]["descricao"] = nova_desc_alt_edit.strip()
+                salvar_estado()
+                st.success("Alteração de escopo atualizada.")
+                st.rerun()
+            # --------- EXCLUSÃO ---------
+            if st.button("Excluir alteração selecionada"):
+                tap["alteracoesEscopo"].pop(idx_alt)
+                salvar_estado()
+                st.success("Alteração excluída.")
+                st.rerun()
+        else:
+            st.caption("Nenhuma alteração registrada.")
+
+    if st.button("💾 Salvar TAP", type="primary"):
+        salvar_estado()
+        st.success("TAP salvo e persistido no banco.")
+
+# --------------------------------------------------------
+# TAB 2 - EAP / CURVA S TRABALHO
+# --------------------------------------------------------
+
+with tabs[2]:
+    st.markdown("### 📦 Estrutura Analítica do Projeto (EAP)")
+
+    with st.expander("Cadastrar atividade na EAP", expanded=True):
+        c1, c2, c3, c4 = st.columns([1, 2, 1, 1])
+        with c1:
+            codigo = st.text_input("Código (1.2.3)", key="eap_codigo")
+            nivel = st.selectbox("Nível", [1, 2, 3, 4], index=0, key="eap_nivel")
+        with c2:
+            descricao = st.text_input("Descrição da atividade", key="eap_descricao")
+        with c3:
+            duracao = st.number_input(
+                "Duração (dias)", min_value=1, value=1, key="eap_dur"
+            )
+        with c4:
+            responsavel = st.text_input("Responsável", key="eap_resp")
+
+        col_pp, col_rel, col_stat = st.columns([2, 1, 1])
+        with col_pp:
+            predecessoras_str = st.text_input(
+                "Predecessoras (códigos separados por vírgula)", key="eap_pred"
+            )
+        with col_rel:
+            relacao = st.selectbox(
+                "Relação", ["FS", "FF", "SS", "SF"], index=0, key="eap_rel"
+            )
+        with col_stat:
+            status = st.selectbox(
+                "Status",
+                ["nao-iniciado", "em-andamento", "em-analise", "em-revisao", "concluido"],
+                index=0,
+                key="eap_status",
+            )
+
+        if st.button("Incluir atividade EAP", type="primary", key="eap_add_btn"):
+            if not codigo.strip() or not descricao.strip():
+                st.warning("Informe código e descrição.")
+            else:
+                preds = [x.strip() for x in predecessoras_str.split(",") if x.strip()]
+                eapTasks.append(
+                    {
+                        "id": int(datetime.now().timestamp() * 1000),
+                        "codigo": codigo.strip(),
+                        "descricao": descricao.strip(),
+                        "nivel": int(nivel),
+                        "predecessoras": preds,
+                        "responsavel": responsavel.strip(),
+                        "duracao": int(duracao),
+                        "relacao": relacao,
+                        "status": status,
+                    }
+                )
+                salvar_estado()
+                st.success("Atividade adicionada.")
+                st.rerun()
+
+    if eapTasks:
+        st.markdown("#### Tabela de atividades da EAP")
+        df_eap = pd.DataFrame(eapTasks)
+        df_eap_sorted = df_eap.sort_values(by="codigo")
+        st.dataframe(df_eap_sorted.drop(columns=["id"]), use_container_width=True, height=260)
+
+        idx_eap = st.selectbox(
+            "Selecione a atividade para editar / excluir",
+            options=list(range(len(df_eap_sorted))),
+            format_func=lambda i: f"{df_eap_sorted.iloc[i]['codigo']} - {df_eap_sorted.iloc[i]['descricao'][:60]}",
+            key="eap_del_idx"
+        )
+
+        id_sel = int(df_eap_sorted.iloc[idx_eap]["id"])
+        tarefa_sel = next((t for t in eapTasks if t.get("id") == id_sel), None)
+
+        # --------- EDIÇÃO DE ATIVIDADE DA EAP ---------
+        if tarefa_sel:
+            st.markdown("#### Editar atividade selecionada")
+            ce1, ce2, ce3, ce4 = st.columns([1, 2, 1, 1])
+            with ce1:
+                codigo_edit = st.text_input(
+                    "Código (edição)",
+                    value=tarefa_sel.get("codigo", ""),
+                    key="eap_edit_codigo"
+                )
+                nivel_edit = st.selectbox(
+                    "Nível (edição)",
+                    [1, 2, 3, 4],
+                    index=[1, 2, 3, 4].index(int(tarefa_sel.get("nivel", 1))),
+                    key="eap_edit_nivel"
+                )
+            with ce2:
+                desc_edit = st.text_input(
+                    "Descrição da atividade (edição)",
+                    value=tarefa_sel.get("descricao", ""),
+                    key="eap_edit_desc"
+                )
+            with ce3:
+                dur_edit = st.number_input(
+                    "Duração (dias) - edição",
+                    min_value=1,
+                    value=int(tarefa_sel.get("duracao", 1)),
+                    key="eap_edit_dur"
+                )
+            with ce4:
+                resp_edit = st.text_input(
+                    "Responsável (edição)",
+                    value=tarefa_sel.get("responsavel", ""),
+                    key="eap_edit_resp"
+                )
+
+            ce5, ce6, ce7 = st.columns([2, 1, 1])
+            with ce5:
+                preds_edit_str = ", ".join(tarefa_sel.get("predecessoras", []))
+                preds_edit = st.text_input(
+                    "Predecessoras (edição)",
+                    value=preds_edit_str,
+                    key="eap_edit_pred"
+                )
+            with ce6:
+                relacao_opts = ["FS", "FF", "SS", "SF"]
+                relacao_val = tarefa_sel.get("relacao", "FS")
+                if relacao_val not in relacao_opts:
+                    relacao_val = "FS"
+                relacao_edit = st.selectbox(
+                    "Relação (edição)",
+                    relacao_opts,
+                    index=relacao_opts.index(relacao_val),
+                    key="eap_edit_rel"
+                )
+            with ce7:
+                status_opts = ["nao-iniciado", "em-andamento", "em-analise", "em-revisao", "concluido"]
+                status_val = tarefa_sel.get("status", "nao-iniciado")
+                if status_val not in status_opts:
+                    status_val = "nao-iniciado"
+                status_edit = st.selectbox(
+                    "Status (edição)",
+                    status_opts,
+                    index=status_opts.index(status_val),
+                    key="eap_edit_status"
+                )
+
+            if st.button("Salvar alterações da atividade", key="eap_edit_btn"):
+                tarefa_sel["codigo"] = codigo_edit.strip()
+                tarefa_sel["nivel"] = int(nivel_edit)
+                tarefa_sel["descricao"] = desc_edit.strip()
+                tarefa_sel["duracao"] = int(dur_edit)
+                tarefa_sel["responsavel"] = resp_edit.strip()
+                tarefa_sel["predecessoras"] = [
+                    x.strip() for x in preds_edit.split(",") if x.strip()
+                ]
+                tarefa_sel["relacao"] = relacao_edit
+                tarefa_sel["status"] = status_edit
+                salvar_estado()
+                st.success("Atividade atualizada.")
+                st.rerun()
+
+        # --------- EXCLUSÃO ---------
+        if st.button("Excluir atividade selecionada", key="eap_del_btn"):
+            eapTasks[:] = [t for t in eapTasks if t.get("id") != id_sel]
+            salvar_estado()
+            st.success("Atividade excluída.")
+            st.rerun()
+    else:
+        st.info("Nenhuma atividade cadastrada na EAP ainda.")
+
+    st.markdown("#### Curva S de trabalho (CPM / Gantt simplificado)")
+    if eapTasks:
+        if tap.get("dataInicio"):
+            fig_s = gerar_curva_s_trabalho(eapTasks, tap["dataInicio"])
+            if fig_s:
+                st.plotly_chart(fig_s, use_container_width=True, key="curva_s_trabalho_main")
+            else:
+                st.warning("Não foi possível gerar a Curva S de trabalho.")
+        else:
+            st.warning("Defina a data de início no TAP para gerar a Curva S de trabalho.")
+    else:
+        st.caption("Cadastre atividades na EAP para gerar a Curva S.")
+
+# --------------------------------------------------------
+# TAB 3 - FINANCEIRO / CURVA S
+# --------------------------------------------------------
+
+with tabs[3]:
+    st.markdown("### 💰 Lançamentos financeiros do projeto")
+
+    with st.expander("Adicionar lançamento financeiro", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            tipo = st.selectbox("Tipo", ["Entrada", "Saída"], index=0, key="fin_tipo")
+            categoria = st.selectbox(
+                "Categoria (somente para Saída)",
+                ["", "Mão de Obra", "Custos Diretos", "Impostos"],
+                index=0,
+                key="fin_categoria",
+            )
+        with c2:
+            descricao = st.text_input("Descrição", key="fin_desc")
+            subcategoria = st.text_input("Subcategoria", key="fin_sub")
+        with c3:
+            valor = st.number_input(
+                "Valor (R$)", min_value=0.0, step=100.0, key="fin_val"
+            )
+            recorrencia = st.selectbox(
+                "Recorrência",
+                ["Nenhuma", "Diária", "Semanal", "Quinzenal", "Mensal"],
+                index=0,
+                key="fin_rec",
+            )
+
+        c4, c5, c6 = st.columns(3)
+        with c4:
+            data_prevista = st.date_input("Data prevista", key="fin_data_prev")
+        with c5:
+            realizado = st.checkbox("Realizado?", key="fin_realizado")
+        with c6:
+            data_realizada = st.date_input(
+                "Data realizada", key="fin_data_real", value=date.today()
+            )
+
+        c7, _, _ = st.columns(3)
+        with c7:
+            qtd_recorrencias = st.number_input(
+                "Quantidade de recorrências",
+                min_value=1,
+                value=1,
+                key="fin_qtd_rec",
+            )
+
+        if st.button("Adicionar lançamento", type="primary"):
+            if not descricao.strip() or valor <= 0:
+                st.warning("Informe descrição e valor maior que zero.")
+            else:
+                if tipo == "Saída" and not categoria:
+                    st.warning("Selecione a categoria para Saída.")
+                else:
+                    lanc = {
+                        "id": int(datetime.now().timestamp() * 1000),
+                        "tipo": tipo,
+                        "descricao": descricao.strip(),
+                        "categoria": categoria if tipo == "Saída" else "",
+                        "subcategoria": subcategoria.strip(),
+                        "valor": float(valor),
+                        "recorrencia": recorrencia,
+                        "qtdRecorrencias": int(qtd_recorrencias) if recorrencia != "Nenhuma" else 1,
+                        "dataPrevista": data_prevista.strftime("%Y-%m-%d"),
+                        "realizado": bool(realizado),
+                        "dataRealizada": data_realizada.strftime("%Y-%m-%d")
+                        if realizado
+                        else "",
+                    }
+                    finances.append(lanc)
+                    salvar_estado()
+                    st.success("Lançamento adicionado.")
+                    st.rerun()
+
+    if finances:
+        st.markdown("#### Extrato financeiro detalhado")
+
+        df_fin_base = pd.DataFrame(finances)
+
+        if "qtdRecorrencias" not in df_fin_base.columns:
+            df_fin_base["qtdRecorrencias"] = 1
+
+        df_fin_base["qtdRecorrencias"] = df_fin_base["qtdRecorrencias"].fillna(1)
+
+        if "recorrencia" not in df_fin_base.columns:
+            df_fin_base["recorrencia"] = "Nenhuma"
+
+        linhas = []
+        for _, row in df_fin_base.iterrows():
+            rec = row.get("recorrencia", "Nenhuma")
+
+            qtd_raw = row.get("qtdRecorrencias", 1)
+            if pd.isna(qtd_raw):
+                qtd = 1
+            else:
+                try:
+                    qtd = int(qtd_raw)
+                except Exception:
+                    qtd = 1
+
+            data_base = datetime.strptime(row["dataPrevista"], "%Y-%m-%d").date()
+
+            if rec == "Diária":
+                inc = 1
+            elif rec == "Semanal":
+                inc = 7
+            elif rec == "Quinzenal":
+                inc = 14
+            elif rec == "Mensal":
+                inc = 30
+            else:
+                inc = 0
+
+            if rec == "Nenhuma" or qtd <= 1 or inc == 0:
+                new_row = row.copy()
+                new_row["Prevista"] = row["dataPrevista"]
+                new_row["Parcela"] = ""
+                linhas.append(new_row)
+            else:
+                for i in range(qtd):
+                    new_row = row.copy()
+                    data_parcela = adicionar_dias(data_base, inc * i)
+                    new_row["Prevista"] = data_parcela.strftime("%Y-%m-%d")
+                    new_row["Parcela"] = f"{i+1}/{qtd}"
+                    linhas.append(new_row)
+
+        df_fin_display = pd.DataFrame(linhas)
+
+        df_fin_display["Valor (R$)"] = df_fin_display["valor"].map(
+            lambda x: format_currency_br(x)
+        )
+        df_fin_display["Realizada"] = df_fin_display["dataRealizada"].replace("", "-")
+        df_fin_display["Status"] = df_fin_display["realizado"].map(
+            lambda x: "Realizado" if x else "Pendente"
+        )
+        df_fin_display["Recorrência"] = df_fin_display["recorrencia"]
+        df_fin_display["Qtd. rec."] = df_fin_display["qtdRecorrencias"].fillna(1).astype(int)
+
+        cols_show = [
+            "tipo",
+            "descricao",
+            "categoria",
+            "subcategoria",
+            "Valor (R$)",
+            "Prevista",
+            "Realizada",
+            "Status",
+            "Recorrência",
+            "Qtd. rec.",
+            "Parcela",
+        ]
+        st.dataframe(
+            df_fin_display[cols_show], use_container_width=True, height=260
+        )
+
+        idx_fin = st.selectbox(
+            "Selecione o lançamento para editar / excluir",
+            options=list(range(len(df_fin_display))),
+            format_func=lambda i: f"{df_fin_display.iloc[i]['tipo']} - {df_fin_display.iloc[i]['descricao'][:50]} - {df_fin_display.iloc[i]['Valor (R$)']} - Prevista {df_fin_display.iloc[i]['Prevista']}",
+            key="fin_del_idx"
+        )
+
+                # --------- EDIÇÃO DE LANÇAMENTO FINANCEIRO ---------
+        sel_id = df_fin_display.iloc[idx_fin]["id"]
+        lanc_sel = next((l for l in finances if l["id"] == sel_id), None)
+
+        if lanc_sel:
+            st.markdown("#### Editar lançamento selecionado")
+            fe1, fe2, fe3 = st.columns(3)
+            with fe1:
+                tipo_opts = ["Entrada", "Saída"]
+                tipo_val = lanc_sel.get("tipo", "Entrada")
+                if tipo_val not in tipo_opts:
+                    tipo_val = "Entrada"
+                tipo_edit = st.selectbox(
+                    "Tipo (edição)",
+                    tipo_opts,
+                    index=tipo_opts.index(tipo_val),
+                    key=f"fin_tipo_edit_{sel_id}",   # <-- key única por lançamento
+                )
+
+                cat_opts = ["", "Mão de Obra", "Custos Diretos", "Impostos"]
+                cat_val = lanc_sel.get("categoria", "")
+                if cat_val not in cat_opts:
+                    cat_val = ""
+                categoria_edit = st.selectbox(
+                    "Categoria (edição - somente Saída)",
+                    cat_opts,
+                    index=cat_opts.index(cat_val),
+                    key=f"fin_categoria_edit_{sel_id}",  # <-- key única
+                )
+
+            with fe2:
+                desc_edit = st.text_input(
+                    "Descrição (edição)",
+                    value=lanc_sel.get("descricao", ""),
+                    key=f"fin_desc_edit_{sel_id}",  # <-- key única
+                )
+                sub_edit = st.text_input(
+                    "Subcategoria (edição)",
+                    value=lanc_sel.get("subcategoria", ""),
+                    key=f"fin_sub_edit_{sel_id}",   # <-- key única
+                )
+
+            with fe3:
+                valor_edit = st.number_input(
+                    "Valor (R$) - edição",
+                    min_value=0.0,
+                    value=float(lanc_sel.get("valor", 0.0)),
+                    step=100.0,
+                    key=f"fin_val_edit_{sel_id}",   # <-- key única
+                )
+                rec_opts = ["Nenhuma", "Diária", "Semanal", "Quinzenal", "Mensal"]
+                rec_val = lanc_sel.get("recorrencia", "Nenhuma")
+                if rec_val not in rec_opts:
+                    rec_val = "Nenhuma"
+                recorrencia_edit = st.selectbox(
+                    "Recorrência (edição)",
+                    rec_opts,
+                    index=rec_opts.index(rec_val),
+                    key=f"fin_rec_edit_{sel_id}",   # <-- key única
+                )
+
+            fe4, fe5, fe6 = st.columns(3)
+            with fe4:
+                dp_str = lanc_sel.get("dataPrevista") or date.today().strftime("%Y-%m-%d")
+                try:
+                    dp_dt = datetime.strptime(dp_str, "%Y-%m-%d").date()
+                except Exception:
+                    dp_dt = date.today()
+                data_prevista_edit = st.date_input(
+                    "Data prevista (edição)",
+                    value=dp_dt,
+                    key=f"fin_data_prev_edit_{sel_id}",  # <-- key única
+                )
+
+            with fe5:
+                realizado_edit = st.checkbox(
+                    "Realizado? (edição)",
+                    value=bool(lanc_sel.get("realizado")),
+                    key=f"fin_realizado_edit_{sel_id}",  # <-- key única
+                )
+
+            with fe6:
+                dr_str = lanc_sel.get("dataRealizada") or date.today().strftime("%Y-%m-%d")
+                try:
+                    dr_dt = datetime.strptime(dr_str, "%Y-%m-%d").date()
+                except Exception:
+                    dr_dt = date.today()
+                data_realizada_edit = st.date_input(
+                    "Data realizada (edição)",
+                    value=dr_dt,
+                    key=f"fin_data_real_edit_{sel_id}",   # <-- key única
+                )
+
+            fe7, _, _ = st.columns(3)
+            with fe7:
+                qtd_base = lanc_sel.get("qtdRecorrencias", 1)
+                try:
+                    qtd_base_int = int(qtd_base)
+                except Exception:
+                    qtd_base_int = 1
+                qtd_rec_edit = st.number_input(
+                    "Quantidade de recorrências (edição)",
+                    min_value=1,
+                    value=qtd_base_int,
+                    key=f"fin_qtd_rec_edit_{sel_id}",      # <-- key única
+                )
+
+            if st.button("Salvar alterações do lançamento selecionado", key="fin_edit_save"):
+                for l in finances:
+                    if l["id"] == sel_id:
+                        l["tipo"] = tipo_edit
+                        l["descricao"] = desc_edit.strip()
+                        l["categoria"] = categoria_edit if tipo_edit == "Saída" else ""
+                        l["subcategoria"] = sub_edit.strip()
+                        l["valor"] = float(valor_edit)
+                        l["recorrencia"] = recorrencia_edit
+                        l["qtdRecorrencias"] = int(qtd_rec_edit) if recorrencia_edit != "Nenhuma" else 1
+                        l["dataPrevista"] = data_prevista_edit.strftime("%Y-%m-%d")
+                        l["realizado"] = bool(realizado_edit)
+                        l["dataRealizada"] = (
+                            data_realizada_edit.strftime("%Y-%m-%d")
+                            if realizado_edit
+                            else ""
+                        )
+                        break
+                salvar_estado()
+                st.success("Lançamento atualizado.")
+                st.rerun()
+
+        # --------- EXCLUSÃO ---------
+        if st.button("Excluir lançamento selecionado", key="fin_del_btn"):
+            finances[:] = [l for l in finances if l["id"] != sel_id]
+            salvar_estado()
+            st.success("Lançamento excluído.")
+            st.rerun()
+
+        total_entradas = df_fin_display[df_fin_display["tipo"] == "Entrada"]["valor"].sum()
+        total_saidas = df_fin_display[df_fin_display["tipo"] == "Saída"]["valor"].sum()
+        saldo = total_entradas - total_saidas
+        st.markdown(
+            f"**Total de Entradas:** {format_currency_br(total_entradas)} &nbsp;&nbsp; "
+            f"**Total de Saídas:** {format_currency_br(total_saidas)} &nbsp;&nbsp; "
+            f"**Saldo:** {format_currency_br(saldo)}"
+        )
+
+        st.markdown("#### Curva S Financeira (Previsto x Realizado)")
+        c1, c2 = st.columns(2)
+        with c1:
+            inicio_mes = st.text_input(
+                "Início do período (AAAA-MM)",
+                value=f"{datetime.now().year}-{str(datetime.now().month).zfill(2)}",
+                key="fluxo_inicio",
+            )
+        with c2:
+            meses = st.number_input(
+                "Número de meses", min_value=1, max_value=36, value=6, key="fluxo_meses"
+            )
+
+        if st.button("Gerar Curva S Financeira", type="primary"):
+            df_fluxo, fig_fluxo = gerar_curva_s_financeira(
+                finances, inicio_mes, int(meses)
+            )
+            if fig_fluxo:
+                st.plotly_chart(fig_fluxo, use_container_width=True)
+            else:
+                st.warning(
+                    "Não foi possível gerar a Curva S financeira. Verifique os lançamentos."
+                )
+    else:
+        st.info("Nenhum lançamento financeiro cadastrado até o momento.")
+
+# --------------------------------------------------------
+# TAB 4 - KPIs
+# --------------------------------------------------------
+
+with tabs[4]:
+    st.markdown("### 📊 KPIs de Qualidade")
+
+    with st.expander("Registrar ponto de KPI", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            nome_kpi = st.text_input("Nome do KPI", key="kpi_nome")
+        with c2:
+            unidade = st.text_input(
+                "Unidade (% , horas, nº itens, etc.)", key="kpi_unid"
+            )
+        with c3:
+            meses_proj = st.number_input(
+                "Duração do projeto (meses)",
+                min_value=1,
+                max_value=60,
+                value=12,
+                key="kpi_meses",
+            )
+        with c4:
+            mes_ref = st.number_input(
+                "Mês de referência",
+                min_value=1,
+                max_value=60,
+                value=1,
+                key="kpi_mes_ref",
+            )
+
+        c5, c6 = st.columns(2)
+        with c5:
+            prev = st.number_input("Valor previsto", value=0.0, key="kpi_prev")
+        with c6:
+            real = st.number_input("Valor realizado", value=0.0, key="kpi_real")
+
+        if st.button("Adicionar ponto KPI", type="primary"):
+            if not nome_kpi.strip() or not unidade.strip():
+                st.warning("Informe nome e unidade do KPI.")
+            else:
+                kpis.append(
+                    {
+                        "nome": nome_kpi.strip(),
+                        "unidade": unidade.strip(),
+                        "mesesProjeto": int(meses_proj),
+                        "mes": int(mes_ref),
+                        "previsto": float(prev),
+                        "realizado": float(real),
+                    }
+                )
+                salvar_estado()
+                st.success("Ponto de KPI registrado.")
+                st.rerun()
+
+    if kpis:
+        st.markdown("#### Tabela de KPIs")
+        df_k = pd.DataFrame(kpis)
+        st.dataframe(df_k, use_container_width=True, height=260)
+
+        idx_kpi = st.selectbox(
+            "Selecione o ponto de KPI para editar / excluir",
+            options=list(range(len(kpis))),
+            format_func=lambda i: f"{kpis[i]['nome']} - Mês {kpis[i]['mes']} (Previsto: {kpis[i]['previsto']}, Realizado: {kpis[i]['realizado']})",
+            key="kpi_del_idx"
+        )
+
+        # --------- EDIÇÃO DE KPI ---------
+        k_sel = kpis[idx_kpi]
+        ek1, ek2, ek3, ek4 = st.columns(4)
+        with ek1:
+            nome_kpi_edit = st.text_input(
+                "Nome do KPI (edição)",
+                value=k_sel.get("nome", ""),
+                key="kpi_nome_edit"
+            )
+        with ek2:
+            unidade_edit = st.text_input(
+                "Unidade (edição)",
+                value=k_sel.get("unidade", ""),
+                key="kpi_unid_edit"
+            )
+        with ek3:
+            meses_proj_edit = st.number_input(
+                "Duração do projeto (meses) - edição",
+                min_value=1,
+                max_value=60,
+                value=int(k_sel.get("mesesProjeto", 12)),
+                key="kpi_meses_edit",
+            )
+        with ek4:
+            mes_ref_edit = st.number_input(
+                "Mês de referência - edição",
+                min_value=1,
+                max_value=60,
+                value=int(k_sel.get("mes", 1)),
+                key="kpi_mes_ref_edit",
+            )
+
+        ek5, ek6 = st.columns(2)
+        with ek5:
+            prev_edit = st.number_input(
+                "Valor previsto (edição)",
+                value=float(k_sel.get("previsto", 0.0)),
+                key="kpi_prev_edit"
+            )
+        with ek6:
+            real_edit = st.number_input(
+                "Valor realizado (edição)",
+                value=float(k_sel.get("realizado", 0.0)),
+                key="kpi_real_edit"
+            )
+
+        if st.button("Salvar alterações do KPI selecionado", key="kpi_edit_btn"):
+            k_sel["nome"] = nome_kpi_edit.strip()
+            k_sel["unidade"] = unidade_edit.strip()
+            k_sel["mesesProjeto"] = int(meses_proj_edit)
+            k_sel["mes"] = int(mes_ref_edit)
+            k_sel["previsto"] = float(prev_edit)
+            k_sel["realizado"] = float(real_edit)
+            salvar_estado()
+            st.success("KPI atualizado.")
+            st.rerun()
+
+        if st.button("Excluir ponto de KPI selecionado", key="kpi_del_btn"):
+            kpis.pop(idx_kpi)
+            salvar_estado()
+            st.success("Ponto de KPI excluído.")
+            st.rerun()
+
+        st.markdown("#### Gráfico do KPI")
+        kpi_names = list({k["nome"] for k in kpis})
+        kpi_sel = st.selectbox("Selecione o KPI para plotar", kpi_names, key="kpi_sel")
+        serie = [k for k in kpis if k["nome"] == kpi_sel]
+        serie = sorted(serie, key=lambda x: x["mes"])
+        df_plot = pd.DataFrame(
+            {
+                "Mês": [f"M{p['mes']}" for p in serie],
+                "Previsto": [p["previsto"] for p in serie],
+                "Realizado": [p["realizado"] for p in serie],
+            }
+        )
+        fig_kpi = px.line(
+            df_plot,
+            x="Mês",
+            y=["Previsto", "Realizado"],
+            title=f"Evolução do KPI: {kpi_sel}",
+        )
+        fig_kpi.update_traces(mode="lines+markers")
+        fig_kpi.update_layout(
+            template="plotly_dark",
+            height=350,
+            margin=dict(l=30, r=20, t=35, b=30),
+        )
+        st.plotly_chart(fig_kpi, use_container_width=True)
+    else:
+        st.info("Nenhum KPI registrado até o momento.")
+
+# --------------------------------------------------------
+# TAB 5 - RISCOS
+# --------------------------------------------------------
+
+with tabs[5]:
+    st.markdown("### ⚠️ Registro de riscos")
+
+    def peso_impacto(impacto):
+        if impacto == "alto":
+            return 3
+        if impacto == "medio":
+            return 2
+        return 1
+
+    def peso_prob(prob):
+        if prob == "alta":
+            return 3
+        if prob == "media":
+            return 2
+        return 1
+
+    with st.expander("Adicionar risco", expanded=True):
+        desc_risk = st.text_input("Descrição do risco", key="risk_desc")
+        c1_, c2_, c3_ = st.columns(3)
+        with c1_:
+            impacto = st.selectbox(
+                "Impacto", ["baixo", "medio", "alto"], index=0, key="risk_imp"
+            )
+        with c2_:
+            prob = st.selectbox(
+                "Probabilidade", ["baixa", "media", "alta"], index=0, key="risk_prob"
+            )
+        with c3_:
+            resposta = st.selectbox(
+                "Resposta",
+                ["mitigar", "eliminar", "aceitar", "transferir"],
+                index=0,
+                key="risk_resp",
+            )
+        plano = st.text_area("Plano de tratamento", key="risk_plano")
+
+        if st.button("Adicionar risco", type="primary"):
+            if not desc_risk.strip():
+                st.warning("Descreva o risco.")
+            else:
+                indice = peso_impacto(impacto) * peso_prob(prob)
+                risks.append(
+                    {
+                        "descricao": desc_risk.strip(),
+                        "impacto": impacto,
+                        "prob": prob,
+                        "resposta": resposta,
+                        "plano": plano.strip(),
+                        "indice": indice,
+                    }
+                )
+                salvar_estado()
+                st.success("Risco adicionado.")
+                st.rerun()
+
+    if risks:
+        df_r = pd.DataFrame(risks).sort_values(by="indice", ascending=False)
+        st.markdown("#### Matriz de riscos (ordenada por criticidade)")
+        st.dataframe(
+            df_r[["descricao", "impacto", "prob", "indice", "resposta"]],
+            use_container_width=True,
+            height=260,
+        )
+
+        idx_risk = st.selectbox(
+            "Selecione o risco para editar / excluir",
+            options=list(range(len(risks))),
+            format_func=lambda i: f"{risks[i]['descricao'][:60]} (Índice {risks[i]['indice']})",
+            key="risk_del_idx"
+        )
+
+        # --------- EDIÇÃO DE RISCO ---------
+        r_sel = risks[idx_risk]
+        er1, er2, er3 = st.columns(3)
+        with er1:
+            desc_risk_edit = st.text_input(
+                "Descrição do risco (edição)",
+                value=r_sel.get("descricao", ""),
+                key="risk_desc_edit"
+            )
+        with er2:
+            imp_opts = ["baixo", "medio", "alto"]
+            imp_val = r_sel.get("impacto", "baixo")
+            if imp_val not in imp_opts:
+                imp_val = "baixo"
+            impacto_edit = st.selectbox(
+                "Impacto (edição)",
+                imp_opts,
+                index=imp_opts.index(imp_val),
+                key="risk_imp_edit"
+            )
+        with er3:
+            prob_opts = ["baixa", "media", "alta"]
+            prob_val = r_sel.get("prob", "baixa")
+            if prob_val not in prob_opts:
+                prob_val = "baixa"
+            prob_edit = st.selectbox(
+                "Probabilidade (edição)",
+                prob_opts,
+                index=prob_opts.index(prob_val),
+                key="risk_prob_edit"
+            )
+
+        er4, = st.columns(1)
+        with er4:
+            resp_opts = ["mitigar", "eliminar", "aceitar", "transferir"]
+            resp_val = r_sel.get("resposta", "mitigar")
+            if resp_val not in resp_opts:
+                resp_val = "mitigar"
+            resposta_edit = st.selectbox(
+                "Resposta (edição)",
+                resp_opts,
+                index=resp_opts.index(resp_val),
+                key="risk_resp_edit"
+            )
+
+        plano_edit = st.text_area(
+            "Plano de tratamento (edição)",
+            value=r_sel.get("plano", ""),
+            key="risk_plano_edit"
+        )
+
+        if st.button("Salvar alterações do risco selecionado", key="risk_edit_btn"):
+            r_sel["descricao"] = desc_risk_edit.strip()
+            r_sel["impacto"] = impacto_edit
+            r_sel["prob"] = prob_edit
+            r_sel["resposta"] = resposta_edit
+            r_sel["plano"] = plano_edit.strip()
+            r_sel["indice"] = peso_impacto(impacto_edit) * peso_prob(prob_edit)
+            salvar_estado()
+            st.success("Risco atualizado.")
+            st.rerun()
+
+        if st.button("Excluir risco selecionado", key="risk_del_btn"):
+            risks.pop(idx_risk)
+            salvar_estado()
+            st.success("Risco excluído.")
+            st.rerun()
+    else:
+        st.info("Nenhum risco registrado.")
+
+# --------------------------------------------------------
+# TAB 6 - LIÇÕES
+# --------------------------------------------------------
+
+with tabs[6]:
+    st.markdown("### 🧠 Lições aprendidas")
+
+    with st.expander("Registrar lição", expanded=True):
+        col1_, col2_ = st.columns(2)
+        with col1_:
+            titulo_l = st.text_input("Título da lição", key="lesson_tit")
+            fase_l = st.selectbox(
+                "Fase",
+                ["inicio", "planejamento", "execucao", "monitoramento", "encerramento"],
+                key="lesson_fase",
+            )
+        with col2_:
+            categoria_l = st.selectbox(
+                "Categoria",
+                ["processo", "tecnico", "pessoas", "cliente", "negocio"],
+                key="lesson_cat",
+            )
+        desc_l = st.text_area("Descrição da lição", key="lesson_desc")
+        rec_l = st.text_area(
+            "Recomendação para futuros projetos", key="lesson_rec"
+        )
+
+        if st.button("Adicionar lição", type="primary"):
+            if not titulo_l.strip() or not desc_l.strip():
+                st.warning("Título e descrição são obrigatórios.")
+            else:
+                lessons.append(
+                    {
+                        "titulo": titulo_l.strip(),
+                        "fase": fase_l,
+                        "categoria": categoria_l,
+                        "descricao": desc_l.strip(),
+                        "recomendacao": rec_l.strip(),
+                    }
+                )
+                salvar_estado()
+                st.success("Lição adicionada.")
+                st.rerun()
+
+    if lessons:
+        df_l = pd.DataFrame(lessons)
+        st.dataframe(df_l, use_container_width=True, height=260)
+
+        idx_lesson = st.selectbox(
+            "Selecione a lição para excluir",
+            options=list(range(len(lessons))),
+            format_func=lambda i: f"{lessons[i]['titulo']} - {lessons[i]['fase']} - {lessons[i]['categoria']}",
+            key="lesson_del_idx"
+        )
+        if st.button("Excluir lição selecionada", key="lesson_del_btn"):
+            lessons.pop(idx_lesson)
+            salvar_estado()
+            st.success("Lição excluída.")
+            st.rerun()
+    else:
+        st.info("Nenhuma lição registrada.")
+
+# --------------------------------------------------------
+# TAB 7 - ENCERRAMENTO
+# --------------------------------------------------------
+
+with tabs[7]:
+    st.markdown("### ✅ Encerramento do projeto")
+
+    col1__, col2__ = st.columns(2)
+    with col1__:
+        close_data["resumo"] = st.text_area(
+            "Resumo executivo",
+            value=close_data.get("resumo", ""),
+            height=120,
+        )
+        close_data["resultados"] = st.text_area(
+            "Resultados alcançados",
+            value=close_data.get("resultados", ""),
+            height=120,
+        )
+        close_data["escopo"] = st.text_area(
+            "Atendimento aos requisitos / escopo",
+            value=close_data.get("escopo", ""),
+            height=120,
+        )
+
+    with col2__:
+        close_data["aceite"] = st.text_area(
+            "Aceite formal do cliente",
+            value=close_data.get("aceite", ""),
+            height=120,
+        )
+        close_data["recomendacoes"] = st.text_area(
+            "Recomendações para projetos futuros",
+            value=close_data.get("recomendacoes", ""),
+            height=120,
+        )
+        close_data["obs"] = st.text_area(
+            "Observações finais da gerência",
+            value=close_data.get("obs", ""),
+            height=120,
+        )
+
+    if st.button("💾 Salvar encerramento", type="primary"):
+        salvar_estado()
+        st.success("Dados de encerramento salvos.")
+
+# --------------------------------------------------------
+# TAB 8 - RELATÓRIOS HTML
+# --------------------------------------------------------
+
+with tabs[8]:
+    st.markdown("### 📑 Relatórios em HTML / CSS")
+
+    tipo_rel = st.selectbox(
+        "Selecione o relatório",
+        ["Extrato financeiro", "Resumo TAP", "Riscos e Lições", "Relatório completo"],
+        index=0,
+    )
+
+    df_fin = pd.DataFrame(finances) if finances else pd.DataFrame()
+    df_r = pd.DataFrame(risks) if risks else pd.DataFrame()
+    df_l = pd.DataFrame(lessons) if lessons else pd.DataFrame()
+    df_eap_rel = pd.DataFrame(eapTasks) if eapTasks else pd.DataFrame()
+
+    def montar_html_completo(html_corpo: str) -> str:
+        return f"""
+        <!DOCTYPE html>
+        <html lang="pt-BR">
+        <head>
+            <meta charset="utf-8">
+            <title>Relatório do Projeto</title>
+            {CUSTOM_CSS}
+        </head>
+        <body>
+            {html_corpo}
+        </body>
+        </html>
+        """
+
+    # --------------------- RELATÓRIO: EXTRATO FINANCEIRO ---------------------
+    if tipo_rel == "Extrato financeiro":
+        if df_fin.empty:
+            st.info("Não há lançamentos financeiros para gerar o extrato.")
+        else:
+            if "qtdRecorrencias" not in df_fin.columns:
+                df_fin["qtdRecorrencias"] = 1
+            for col in ["categoria", "subcategoria", "dataPrevista", "dataRealizada", "realizado", "tipo"]:
+                if col not in df_fin.columns:
+                    if col == "realizado":
+                        df_fin[col] = False
+                    else:
+                        df_fin[col] = ""
+
+            df_fin["Valor"] = (df_fin["valor"] * df_fin["qtdRecorrencias"]).map(format_currency_br)
+            df_fin["Prevista"] = df_fin["dataPrevista"]
+            df_fin["Realizada"] = df_fin["dataRealizada"].replace("", "-")
+            df_fin["Status"] = df_fin["realizado"].map(
+                lambda x: "Realizado" if x else "Pendente"
+            )
+            df_fin["Tipo"] = df_fin["tipo"]
+            df_fin["Categoria"] = df_fin["categoria"]
+            df_fin["Subcategoria"] = df_fin["subcategoria"]
+
+            df_show = df_fin[
+                [
+                    "Tipo",
+                    "descricao",
+                    "Categoria",
+                    "Subcategoria",
+                    "Valor",
+                    "Prevista",
+                    "Realizada",
+                    "Status",
+                ]
+            ].copy()
+            df_show.columns = [
+                "Tipo",
+                "Descrição",
+                "Categoria",
+                "Subcategoria",
+                "Valor",
+                "Prevista",
+                "Realizada",
+                "Status",
+            ]
+
+            html_tabela = df_show.to_html(
+                index=False,
+                classes="table-report",
+                border=0,
+                justify="left",
+            )
+
+            total_entradas = (df_fin[df_fin["Tipo"] == "Entrada"]["valor"] * df_fin[df_fin["Tipo"] == "Entrada"]["qtdRecorrencias"]).sum()
+            total_saidas = (df_fin[df_fin["Tipo"] == "Saída"]["valor"] * df_fin[df_fin["Tipo"] == "Saída"]["qtdRecorrencias"]).sum()
+            saldo = total_entradas - total_saidas
+
+            html_corpo = f"""
+            <div class="bk-report">
+              <h2>Extrato Financeiro do Projeto</h2>
+              <small>Projeto: {tap.get('nome','')} &mdash; Gerente: {tap.get('gerente','')}</small>
+              <hr class="section-divider">
+              <h3>Resumo financeiro</h3>
+              <p>
+                Total de Entradas: <strong>{format_currency_br(total_entradas)}</strong><br>
+                Total de Saídas: <strong>{format_currency_br(total_saidas)}</strong><br>
+                Saldo acumulado: <strong>{format_currency_br(saldo)}</strong>
+              </p>
+              <h3>Lançamentos detalhados</h3>
+              {html_tabela}
+            </div>
+            """
+
+            components.html(CUSTOM_CSS + html_corpo, height=600, scrolling=True)
+
+            html_completo = montar_html_completo(html_corpo)
+            st.download_button(
+                "⬇️ Baixar relatório em HTML",
+                data=html_completo.encode("utf-8"),
+                file_name="relatorio_extrato_financeiro.html",
+                mime="text/html",
+            )
+
+    # --------------------- RELATÓRIO: RESUMO TAP ---------------------
+    elif tipo_rel == "Resumo TAP":
+        html_corpo = f"""
+        <div class="bk-report">
+          <h2>Resumo do Termo de Abertura do Projeto (TAP)</h2>
+          <small>Projeto ID: {st.session_state.current_project_id}</small>
+          <hr class="section-divider">
+          <h3>Identificação</h3>
+          <p>
+            <strong>Nome:</strong> {tap.get('nome','')}<br>
+            <strong>Gerente:</strong> {tap.get('gerente','')}<br>
+            <strong>Patrocinador:</strong> {tap.get('patrocinador','')}<br>
+            <strong>Data de início:</strong> {tap.get('dataInicio','')}<br>
+            <strong>Status:</strong> {tap.get('status','rascunho')}
+          </p>
+          <h3>Objetivo</h3>
+          <p>{tap.get('objetivo','').replace(chr(10),'<br>')}</p>
+          <h3>Escopo inicial</h3>
+          <p>{tap.get('escopo','').replace(chr(10),'<br>')}</p>
+          <h3>Premissas e restrições</h3>
+          <p>{tap.get('premissas','').replace(chr(10),'<br>')}</p>
+          <h3>Requisitos principais</h3>
+          <p>{tap.get('requisitos','').replace(chr(10),'<br>')}</p>
+        </div>
+        """
+
+        components.html(CUSTOM_CSS + html_corpo, height=700, scrolling=True)
+
+        html_completo = montar_html_completo(html_corpo)
+        st.download_button(
+            "⬇️ Baixar relatório em HTML",
+            data=html_completo.encode("utf-8"),
+            file_name="relatorio_resumo_tap.html",
+            mime="text/html",
+        )
+
+    # --------------------- RELATÓRIO: RISCOS E LIÇÕES ---------------------
+    elif tipo_rel == "Riscos e Lições":
+        if not df_r.empty:
+            df_r_show = df_r[
+                ["descricao", "impacto", "prob", "indice", "resposta"]
+            ].copy()
+            df_r_show.columns = [
+                "Risco",
+                "Impacto",
+                "Probabilidade",
+                "Índice",
+                "Resposta",
+            ]
+            html_riscos = df_r_show.to_html(
+                index=False,
+                classes="table-report",
+                border=0,
+                justify="left",
+            )
+        else:
+            html_riscos = "<p>Não há riscos cadastrados.</p>"
+
+        if not df_l.empty:
+            df_l_show = df_l[
+                ["titulo", "fase", "categoria", "descricao", "recomendacao"]
+            ].copy()
+            df_l_show.columns = [
+                "Título",
+                "Fase",
+                "Categoria",
+                "Lição",
+                "Recomendação",
+            ]
+            html_licoes = df_l_show.to_html(
+                index=False,
+                classes="table-report",
+                border=0,
+                justify="left",
+            )
+        else:
+            html_licoes = "<p>Não há lições registradas.</p>"
+
+        html_corpo = f"""
+        <div class="bk-report">
+          <h2>Riscos e Lições Aprendidas</h2>
+          <small>Projeto: {tap.get('nome','')}</small>
+          <hr class="section-divider">
+          <h3>Riscos mapeados</h3>
+          {html_riscos}
+          <h3>Lições aprendidas</h3>
+          {html_licoes}
+        </div>
+        """
+
+        components.html(CUSTOM_CSS + html_corpo, height=700, scrolling=True)
+
+        html_completo = montar_html_completo(html_corpo)
+        st.download_button(
+            "⬇️ Baixar relatório em HTML",
+            data=html_completo.encode("utf-8"),
+            file_name="relatorio_riscos_licoes.html",
+            mime="text/html",
+        )
+
+    # --------------------- RELATÓRIO COMPLETO ---------------------
+    else:
+        qtd_eap = len(eapTasks)
+        qtd_fin = len(finances)
+        qtd_kpi = len(kpis)
+        qtd_risk = len(risks)
+        qtd_les = len(lessons)
+
+        # Tabela da EAP em HTML
+        if not df_eap_rel.empty:
+            df_eap_show = df_eap_rel[
+                ["codigo", "descricao", "nivel", "duracao", "responsavel", "status", "predecessoras"]
+            ].copy()
+            df_eap_show["predecessoras"] = df_eap_show["predecessoras"].apply(
+                lambda v: ", ".join(v) if isinstance(v, list) else str(v)
+            )
+            df_eap_show.columns = [
+                "Código",
+                "Descrição",
+                "Nível",
+                "Duração (dias)",
+                "Responsável",
+                "Status",
+                "Predecessoras",
+            ]
+            html_eap = df_eap_show.to_html(
+                index=False,
+                classes="table-report",
+                border=0,
+                justify="left",
+            )
+        else:
+            html_eap = "<p>Não há atividades cadastradas na EAP.</p>"
+
+        html_corpo = f"""
+        <div class="bk-report">
+          <h2>Relatório Completo do Projeto</h2>
+          <small>Projeto: {tap.get('nome','')} &mdash; ID {st.session_state.current_project_id}</small>
+
+          <hr class="section-divider">
+
+          <h3>1. Identificação e TAP</h3>
+          <p>
+            <span class="tag-pill"><span class="tag-dot info"></span>TAP</span><br><br>
+            <strong>Gerente:</strong> {tap.get('gerente','')}<br>
+            <strong>Patrocinador:</strong> {tap.get('patrocinador','')}<br>
+            <strong>Data de início:</strong> {tap.get('dataInicio','')}<br>
+            <strong>Status TAP:</strong> {tap.get('status','rascunho')}
+          </p>
+
+          <h3>2. Objetivo e Escopo</h3>
+          <p><strong>Objetivo:</strong><br>{tap.get('objetivo','').replace(chr(10),'<br>')}</p>
+          <p><strong>Escopo inicial:</strong><br>{tap.get('escopo','').replace(chr(10),'<br>')}</p>
+
+          <h3>3. Resumo de números</h3>
+          <p>
+            Atividades na EAP: <strong>{qtd_eap}</strong><br>
+            Lançamentos financeiros: <strong>{qtd_fin}</strong><br>
+            Pontos de KPI: <strong>{qtd_kpi}</strong><br>
+            Riscos registrados: <strong>{qtd_risk}</strong><br>
+            Lições aprendidas: <strong>{qtd_les}</strong>
+          </p>
+
+          <h3>4. Estrutura Analítica do Projeto (EAP)</h3>
+          {html_eap}
+
+          <h3>5. Encerramento</h3>
+          <p><strong>Resumo executivo:</strong><br>{close_data.get('resumo','').replace(chr(10),'<br>')}</p>
+          <p><strong>Resultados alcançados:</strong><br>{close_data.get('resultados','').replace(chr(10),'<br>')}</p>
+          <p><strong>Aceite do cliente:</strong><br>{close_data.get('aceite','').replace(chr(10),'<br>')}</p>
+          <p><strong>Recomendações:</strong><br>{close_data.get('recomendacoes','').replace(chr(10),'<br>')}</p>
+          <p><strong>Observações finais:</strong><br>{close_data.get('obs','').replace(chr(10),'<br>')}</p>
+
+          <p style="margin-top:14px; font-size:11px; color:#9ca3af;">
+            *As curvas S de trabalho, financeira e o KPI principal são exibidos abaixo deste relatório em formato interativo no aplicativo.
+          </p>
+        </div>
+        """
+
+        components.html(CUSTOM_CSS + html_corpo, height=600, scrolling=True)
+
+        html_completo = montar_html_completo(html_corpo)
+        st.download_button(
+            "⬇️ Baixar relatório em HTML",
+            data=html_completo.encode("utf-8"),
+            file_name="relatorio_completo_projeto.html",
+            mime="text/html",
+        )
+
+        # Gráficos interativos logo abaixo do relatório completo
+        st.markdown("#### 📈 Curva S de trabalho")
+        if eapTasks and tap.get("dataInicio"):
+            fig_s = gerar_curva_s_trabalho(eapTasks, tap["dataInicio"])
+            if fig_s:
+                st.plotly_chart(fig_s, use_container_width=True, key="curva_s_trabalho_relatorio")
+        else:
+            st.caption(
+                "Curva S de trabalho indisponível - verifique EAP e data de início."
+            )
+
+        st.markdown("#### 💹 Curva S Financeira")
+        if finances:
+            inicio_mes_auto = (
+                f"{datetime.now().year}-{str(datetime.now().month).zfill(2)}"
+            )
+            df_fluxo, fig_fluxo = gerar_curva_s_financeira(finances, inicio_mes_auto, 6)
+            if fig_fluxo:
+                st.plotly_chart(fig_fluxo, use_container_width=True)
+        else:
+            st.caption("Curva S financeira indisponível - não há lançamentos.")
+
+        st.markdown("#### 📊 KPI principal")
+        if kpis:
+            kpi_names = list({k["nome"] for k in kpis})
+            kpi_sel_auto = kpi_names[0]
+            serie = [k for k in kpis if k["nome"] == kpi_sel_auto]
+            serie = sorted(serie, key=lambda x: x["mes"])
+            df_plot = pd.DataFrame(
+                {
+                    "Mês": [f"M{p['mes']}" for p in serie],
+                    "Previsto": [p["previsto"] for p in serie],
+                    "Realizado": [p["realizado"] for p in serie],
+                }
+            )
+            fig_kpi = px.line(
+                df_plot,
+                x="Mês",
+                y=["Previsto", "Realizado"],
+                title=f"Evolução do KPI: {kpi_sel_auto}",
+            )
+            fig_kpi.update_traces(mode="lines+markers")
+            fig_kpi.update_layout(
+                template="plotly_dark",
+                height=350,
+                margin=dict(l=30, r=20, t=35, b=30),
+            )
+            st.plotly_chart(fig_kpi, use_container_width=True)
+        else:
+            st.caption("Não há KPIs para exibir no relatório completo.")
+
+# --------------------------------------------------------
+# TAB 9 - PLANO DE AÇÃO
+# --------------------------------------------------------
+
+with tabs[9]:
+    st.markdown("### 📌 Plano de Ação")
+
+    with st.expander("Registrar item do plano de ação", expanded=True):
+        pa1, pa2, pa3 = st.columns(3)
+        with pa1:
+            acao_desc = st.text_input("Ação / atividade", key="ap_desc")
+        with pa2:
+            acao_resp = st.text_input("Responsável", key="ap_resp")
+        with pa3:
+            acao_status = st.selectbox(
+                "Status",
+                ["pendente", "em_andamento", "concluido"],
+                key="ap_status",
+            )
+
+        pa4, pa5 = st.columns(2)
+        with pa4:
+            acao_prazo = st.date_input("Prazo", key="ap_prazo", value=date.today())
+        with pa5:
+            if risks:
+                riscos_fmt = [f"{i+1} - {r['descricao'][:50]}" for i, r in enumerate(risks)]
+                idx_risk_ref = st.selectbox(
+                    "Risco associado (opcional)",
+                    options=range(len(risks) + 1),
+                    format_func=lambda i: "Nenhum" if i == 0 else riscos_fmt[i-1],
+                    key="ap_risk_ref"
+                )
+            else:
+                idx_risk_ref = 0
+                st.caption("Nenhum risco cadastrado para associar.")
+
+        if st.button("Adicionar ação", type="primary", key="ap_add_btn"):
+            if not acao_desc.strip():
+                st.warning("Descreva a ação.")
+            else:
+                risk_ref = None
+                if idx_risk_ref > 0:
+                    risk_ref = risks[idx_risk_ref - 1]["descricao"]
+                action_plan.append(
+                    {
+                        "descricao": acao_desc.strip(),
+                        "responsavel": acao_resp.strip(),
+                        "status": acao_status,
+                        "prazo": acao_prazo.strftime("%Y-%m-%d"),
+                        "risco_relacionado": risk_ref,
+                    }
+                )
+                salvar_estado()
+                st.success("Ação adicionada ao plano.")
+                st.rerun()
+
+    if action_plan:
+        df_ap = pd.DataFrame(action_plan)
+        st.markdown("#### Ações cadastradas")
+        st.dataframe(df_ap, use_container_width=True, height=260)
+
+        idx_ap = st.selectbox(
+            "Selecione a ação para excluir",
+            options=list(range(len(action_plan))),
+            format_func=lambda i: f"{action_plan[i]['descricao'][:60]} - {action_plan[i]['status']}",
+            key="ap_del_idx"
+        )
+        if st.button("Excluir ação selecionada", key="ap_del_btn"):
+            action_plan.pop(idx_ap)
+            salvar_estado()
+            st.success("Ação excluída.")
+            st.rerun()
+    else:
+        st.info("Nenhuma ação registrada no plano de ação.")
